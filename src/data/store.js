@@ -186,20 +186,27 @@ export async function registerPortalParticipant({ eventId, role, email, password
     try {
       await client.query('BEGIN');
       let personId;
+      // "FullName" is a generated/computed column (derived from
+      // FirstName + LastName by the database itself) — Postgres
+      // rejects any INSERT/UPDATE that names it explicitly with
+      // "cannot insert a non-DEFAULT value into column". Never include
+      // it in a write; the `fullName` local var above is still used
+      // for the EventParticipant insert's registration code and the
+      // invite email below.
       if (existingPersonRows.length) {
         personId = existingPersonRows[0].PersonId;
         await client.query(
-          `UPDATE "Person" SET "FirstName" = $2, "LastName" = $3, "FullName" = $4,
-             "Company" = COALESCE($5, "Company"), "JobTitle" = COALESCE($6, "JobTitle"),
+          `UPDATE "Person" SET "FirstName" = $2, "LastName" = $3,
+             "Company" = COALESCE($4, "Company"), "JobTitle" = COALESCE($5, "JobTitle"),
              "UpdatedAt" = (now() AT TIME ZONE 'utc')
            WHERE "PersonId" = $1`,
-          [personId, firstName, lastName, fullName, company || null, jobTitle || null]
+          [personId, firstName, lastName, company || null, jobTitle || null]
         );
       } else {
         const { rows } = await client.query(
-          `INSERT INTO "Person" ("Email", "NormalizedEmail", "PasswordHash", "FirstName", "LastName", "FullName", "Company", "JobTitle")
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING "PersonId"`,
-          [email, normalizedEmail, 'not-a-real-hash-self-registered', firstName, lastName, fullName, company || null, jobTitle || null]
+          `INSERT INTO "Person" ("Email", "NormalizedEmail", "PasswordHash", "FirstName", "LastName", "Company", "JobTitle")
+           VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING "PersonId"`,
+          [email, normalizedEmail, 'not-a-real-hash-self-registered', firstName, lastName, company || null, jobTitle || null]
         );
         personId = rows[0].PersonId;
       }
@@ -578,9 +585,17 @@ export async function upsertBrandingForEvent(eventId, eventTitle, patch) {
 // ---------------------------------------------------------------------
 
 export async function getSponsorsForEvent(eventId) {
+  // "VisitCount" used to be a live COUNT(*) against a "BoothVisits"
+  // table — a booth-analytics feature that was apparently planned but
+  // never actually built: no migration anywhere in data/*.sql ever
+  // creates that table, so this query has been throwing "relation
+  // "BoothVisits" does not exist" (a 500) on every single Sponsor
+  // Center page load. Nothing in the Admin UI even reads VisitCount
+  // yet, so it's hardcoded to 0 here until the booth-visit tracking
+  // feature (and its table) actually exists.
   const { rows } = await pool.query(
     `SELECT sp.*, st."Name" AS "TierName", ep."EventId", ep."PersonId" AS "ContactPersonId",
-            COALESCE((SELECT COUNT(*)::int FROM "BoothVisits" bv WHERE bv."SponsorProfileId" = sp."SponsorProfileId"), 0) AS "VisitCount"
+            0 AS "VisitCount"
      FROM "SponsorProfile" sp
      JOIN "EventParticipant" ep ON ep."EventParticipantId" = sp."EventParticipantId"
      LEFT JOIN "SponsorTiers" st ON st."TierId" = sp."TierId"

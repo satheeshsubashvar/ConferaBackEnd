@@ -31,10 +31,16 @@ router.post('/', async (req,res,next)=>{
     let personRow;
     if(person.rowCount) {
       personRow=person.rows[0];
-      const updated=await client.query(`UPDATE "Person" SET "FirstName"=$2,"LastName"=$3,"FullName"=$4,"Company"=$5,"JobTitle"=$6,"ProfilePictureUrl"=COALESCE($7,"ProfilePictureUrl") WHERE "PersonId"=$1 RETURNING *`,[personRow.PersonId,firstName,lastName,`${firstName} ${lastName}`.trim(),b.company||null,b.jobTitle||null,b.profilePictureUrl||null]);
+      // "FullName" is a generated/computed column (derived from
+      // FirstName + LastName by the database itself) — Postgres
+      // rejects any INSERT/UPDATE that names it explicitly with
+      // "cannot insert a non-DEFAULT value into column". Never include
+      // it in a write; SELECT * (below and elsewhere) still reads it
+      // back fine.
+      const updated=await client.query(`UPDATE "Person" SET "FirstName"=$2,"LastName"=$3,"Company"=$4,"JobTitle"=$5,"ProfilePictureUrl"=COALESCE($6,"ProfilePictureUrl") WHERE "PersonId"=$1 RETURNING *`,[personRow.PersonId,firstName,lastName,b.company||null,b.jobTitle||null,b.profilePictureUrl||null]);
       personRow=updated.rows[0];
     } else {
-      const r=await client.query(`INSERT INTO "Person" ("Email","NormalizedEmail","PasswordHash","FirstName","LastName","FullName","Company","JobTitle","ProfilePictureUrl") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,[email,normalized,'not-a-real-hash-admin',firstName,lastName,`${firstName} ${lastName}`.trim(),b.company||null,b.jobTitle||null,b.profilePictureUrl||null]);
+      const r=await client.query(`INSERT INTO "Person" ("Email","NormalizedEmail","PasswordHash","FirstName","LastName","Company","JobTitle","ProfilePictureUrl") VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,[email,normalized,'not-a-real-hash-admin',firstName,lastName,b.company||null,b.jobTitle||null,b.profilePictureUrl||null]);
       personRow=r.rows[0];
     }
     const exists=await client.query('SELECT "EventParticipantId" FROM "EventParticipant" WHERE "EventId"=$1 AND "PersonId"=$2 AND "IsDeleted"=false LIMIT 1',[req.params.eventId,personRow.PersonId]);
@@ -130,7 +136,9 @@ router.post('/import', importUpload.single('file'), async (req, res, next) => {
         if (person.rowCount) {
           personId = person.rows[0].PersonId; passwordHash = person.rows[0].PasswordHash;
         } else {
-          const r = await client.query('INSERT INTO "Person" ("Email","NormalizedEmail","PasswordHash","FirstName","LastName","FullName","Company") VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING "PersonId","PasswordHash"', [email, normalized, 'not-a-real-hash-import', firstName, lastName, fullName, company]);
+          // "FullName" is a generated column — see the note in POST /
+          // above. Never write it explicitly.
+          const r = await client.query('INSERT INTO "Person" ("Email","NormalizedEmail","PasswordHash","FirstName","LastName","Company") VALUES ($1,$2,$3,$4,$5,$6) RETURNING "PersonId","PasswordHash"', [email, normalized, 'not-a-real-hash-import', firstName, lastName, company]);
           personId = r.rows[0].PersonId; passwordHash = r.rows[0].PasswordHash;
         }
         const exists = await client.query('SELECT "EventParticipantId" FROM "EventParticipant" WHERE "EventId"=$1 AND "PersonId"=$2 AND "IsDeleted"=false LIMIT 1', [req.params.eventId, personId]);

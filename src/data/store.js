@@ -624,22 +624,41 @@ const DEFAULT_SPONSOR_TIERS = [
 
 async function ensureDefaultSponsorTiers() {
   for (const tier of DEFAULT_SPONSOR_TIERS) {
-    await pool.query(
-      `INSERT INTO "SponsorTiers" ("Name","SortOrder")
-       SELECT $1,$2 WHERE NOT EXISTS (
-         SELECT 1 FROM "SponsorTiers" WHERE LOWER("Name")=LOWER($1) AND "IsDeleted"=false
-       )`,
-      [tier.name, tier.sortOrder]
-    );
-    await pool.query(
-      `UPDATE "SponsorTiers" SET "SortOrder"=$2 WHERE LOWER("Name")=LOWER($1) AND "IsDeleted"=false`,
-      [tier.name, tier.sortOrder]
-    );
+    try {
+      // Explicit ::text/::int casts avoid Postgres "could not determine
+      // data type of parameter" on a SELECT whose only columns are bind
+      // parameters. The whole insert+update pair is also wrapped in its
+      // own try/catch so one tier failing to seed, for any reason, can
+      // never take down the rest of Sponsor Center's page load — an
+      // uncaught error in this loop was exactly why *every* Sponsor
+      // Center load 500'd and the "New Sponsor" tier dropdown had
+      // nothing to render at all.
+      await pool.query(
+        `INSERT INTO "SponsorTiers" ("Name","SortOrder")
+         SELECT $1::text, $2::int WHERE NOT EXISTS (
+           SELECT 1 FROM "SponsorTiers" WHERE LOWER("Name")=LOWER($1::text) AND "IsDeleted"=false
+         )`,
+        [tier.name, tier.sortOrder]
+      );
+      await pool.query(
+        `UPDATE "SponsorTiers" SET "SortOrder"=$2 WHERE LOWER("Name")=LOWER($1) AND "IsDeleted"=false`,
+        [tier.name, tier.sortOrder]
+      );
+    } catch (err) {
+      console.error(`[sponsor tiers] Failed to seed default tier "${tier.name}" (non-fatal):`, err.message);
+    }
   }
 }
 
 export async function getSponsorTiers() {
-  await ensureDefaultSponsorTiers();
+  // Never let a seeding hiccup here take the whole page down — the
+  // caller (Sponsor Center) needs whatever tiers already exist even if
+  // seeding the defaults failed for some reason this time.
+  try {
+    await ensureDefaultSponsorTiers();
+  } catch (err) {
+    console.error('[sponsor tiers] ensureDefaultSponsorTiers failed (non-fatal):', err.message);
+  }
   const { rows } = await pool.query(
     'SELECT * FROM "SponsorTiers" WHERE "IsDeleted" = false ORDER BY "SortOrder" ASC, "Name" ASC'
   );

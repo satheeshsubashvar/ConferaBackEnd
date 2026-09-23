@@ -37,10 +37,13 @@ router.post('/', async (req,res,next)=>{
     if(exists.rowCount) { await client.query('ROLLBACK'); return res.status(409).json({error:'This person is already an attendee for this event.'}); }
     const ep=await client.query(`INSERT INTO "EventParticipant" ("EventId","PersonId","Role","Company","JobTitle","RegistrationCode","Status") VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,[req.params.eventId,personRow.PersonId,b.role||'Attendee',b.company||null,b.jobTitle||null,`ATT-${Date.now()}`,b.status||'Confirmed']);
     await client.query('COMMIT');
-    await sendPortalInviteIfNeeded({
+    // Fire-and-forget — a real Gmail send is a network round-trip with no
+    // reason to make the caller wait on it, and this never throws (see its
+    // own try/catch).
+    sendPortalInviteIfNeeded({
       personId: personRow.PersonId, email: personRow.Email, fullName: personRow.FullName,
       passwordHash: personRow.PasswordHash, eventId: req.params.eventId,
-    });
+    }).catch(() => {});
     res.status(201).json({EventParticipantId:ep.rows[0].EventParticipantId,PersonId:personRow.PersonId,Role:ep.rows[0].Role,Status:ep.rows[0].Status,Company:ep.rows[0].Company,JobTitle:ep.rows[0].JobTitle,FullName:personRow.FullName,FirstName:personRow.FirstName,LastName:personRow.LastName,Email:personRow.Email,ProfilePictureUrl:personRow.ProfilePictureUrl,IsActive:ep.rows[0].IsActive});
   } catch(e){await client.query('ROLLBACK').catch(()=>{});next(e)} finally{client.release()}
 });
@@ -77,12 +80,17 @@ router.post('/import', async (req,res,next)=>{
       invites.push({personId,email,fullName,passwordHash});
     }
     await client.query('COMMIT');
-    // Fire after commit, sequentially — one broken invite (bad email,
-    // send failure) should never roll back or block the rest of the
-    // import, and sendPortalInviteIfNeeded already never throws.
-    for (const invite of invites) {
-      await sendPortalInviteIfNeeded({ ...invite, eventId: req.params.eventId });
-    }
+    // Fire after commit, and NOT awaited — this is what made bulk imports
+    // slow. With real SMTP now configured, each invite is a genuine
+    // network round-trip to Gmail (hundreds of ms to a few seconds); an
+    // import of 30+ rows was taking 30+ seconds because every row's email
+    // was sent one at a time before the response could go out. Since
+    // sendPortalInviteIfNeeded never throws (see its own try/catch), there's
+    // nothing to lose by letting all of these run in the background while
+    // the response returns immediately.
+    invites.forEach((invite) => {
+      sendPortalInviteIfNeeded({ ...invite, eventId: req.params.eventId }).catch(() => {});
+    });
     res.status(201).json({created:created.length});
   } catch(e){ await client.query('ROLLBACK').catch(()=>{}); next(e); } finally { client.release(); }
 });

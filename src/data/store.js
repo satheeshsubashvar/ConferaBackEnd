@@ -671,10 +671,18 @@ export async function createSponsor(eventId, payload, options = {}) {
 
     await client.query('COMMIT');
     if (!options.skipInvite) {
-      await sendPortalInviteIfNeeded({
+      // Fire-and-forget: a bulk Excel import calls this once per row, and
+      // now that real SMTP is configured, each send is a genuine network
+      // round-trip to Gmail (hundreds of ms to a few seconds). Awaiting it
+      // here made "Import Sponsors" visibly crawl on any file with more
+      // than a handful of rows. sendPortalInviteIfNeeded never throws
+      // (see its own try/catch), so nothing is lost by not waiting on it —
+      // the created sponsor is returned immediately and the invite email
+      // goes out in the background.
+      sendPortalInviteIfNeeded({
         personId, email: payload.contactEmail, fullName: payload.contactName,
         passwordHash, eventId,
-      });
+      }).catch(() => {});
     }
     return getSponsorById(rows[0].SponsorProfileId);
   } catch (err) {
@@ -2001,11 +2009,15 @@ export async function createSpeaker(eventId, payload, options = {}) {
 
     await client.query('COMMIT');
     if (!options.skipInvite) {
-      await sendPortalInviteIfNeeded({
+      // Fire-and-forget — see the matching comment in createSponsor above.
+      // This is the call that made "Import Speakers" slow: it used to run
+      // once per row inside the import loop, blocking on a real Gmail send
+      // each time.
+      sendPortalInviteIfNeeded({
         personId, email: payload.email,
         fullName: `${payload.firstName} ${payload.lastName}`.trim(),
         passwordHash, eventId,
-      });
+      }).catch(() => {});
     }
     return getSpeakerByProfileId(speakerProfileId);
   } catch (err) {
@@ -2234,10 +2246,11 @@ export async function createExhibitor(eventId, payload, options = {}) {
 
     await client.query('COMMIT');
     if (!options.skipInvite) {
-      await sendPortalInviteIfNeeded({
+      // Fire-and-forget — see the matching comment in createSponsor above.
+      sendPortalInviteIfNeeded({
         personId, email: payload.contactEmail, fullName: payload.contactName,
         passwordHash, eventId,
-      });
+      }).catch(() => {});
     }
     return getExhibitorById(exhibitorProfileId);
   } catch (err) {

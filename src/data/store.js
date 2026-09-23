@@ -1251,7 +1251,100 @@ export async function getAdminNavTree() {
   return buildNavTree(rows, 'AdminNavItemId', 'ParentId');
 }
 
+// createEvent() never inserted PortalNavItems for a new event — only
+// seed.js's one-time demo seeding and the one-off
+// add_missing_portal_nav.sql backfill migration ever populated this
+// table. Any event created through the normal "New Event" flow in
+// Admin since then has ZERO rows here, which means the Portal sidebar
+// silently renders empty (PortalSidebar just gets items=[], no error)
+// for every single attendee/speaker/sponsor/exhibitor of that event.
+// This mirrors the same canonical tree seed.js seeds for its demo
+// event, so any event missing nav items gets it the first time anyone
+// loads its Portal — no manual SQL needed, and it can't duplicate rows
+// for an event that already has some (real or previously backfilled).
+async function ensureDefaultPortalNavItems(eventId) {
+  try {
+    const { rows: existing } = await pool.query(
+      'SELECT 1 FROM "PortalNavItems" WHERE "EventId" = $1 LIMIT 1',
+      [eventId]
+    );
+    if (existing.length) return;
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      // Re-check inside the transaction in case another request seeded
+      // it between the check above and BEGIN — still not perfectly
+      // race-free without a table lock, but good enough for how rarely
+      // two people load a brand-new event's Portal at the same instant.
+      const { rows: recheck } = await client.query(
+        'SELECT 1 FROM "PortalNavItems" WHERE "EventId" = $1 LIMIT 1',
+        [eventId]
+      );
+      if (recheck.length) { await client.query('ROLLBACK'); return; }
+
+      const insertPortalNav = async (key, label, opts = {}) => {
+        const { icon = null, sortOrder = 0, route = null, badgeCount = null, parentId = null } = opts;
+        const res = await client.query(
+          `INSERT INTO "PortalNavItems" ("EventId", "ParentId", "Key", "Label", "Icon", "Route", "SortOrder", "BadgeCount")
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING "PortalNavItemId"`,
+          [eventId, parentId, key, label, icon, route, sortOrder, badgeCount]
+        );
+        return res.rows[0].PortalNavItemId;
+      };
+
+      await insertPortalNav('home', 'Home', { icon: 'Home', sortOrder: 0, route: '/home' });
+
+      const agendaNav = await insertPortalNav('agenda', 'Agenda', { icon: 'Calendar', sortOrder: 1 });
+      await insertPortalNav('agenda-sessions', 'Sessions', { icon: 'Clock', sortOrder: 0, parentId: agendaNav, route: '/agenda/sessions' });
+
+      await insertPortalNav('attendees', 'Attendees', { icon: 'User', sortOrder: 2, route: '/attendees' });
+      await insertPortalNav('community', 'Community', { icon: 'MessageSquare', sortOrder: 3, route: '/community' });
+      await insertPortalNav('messages', 'Messages', { icon: 'Mail', sortOrder: 4, route: '/messages' });
+      await insertPortalNav('photos', 'Photos', { icon: 'Image', sortOrder: 5, route: '/photos' });
+      await insertPortalNav('sponsors', 'Sponsors', { icon: 'Star', sortOrder: 6, route: '/sponsors' });
+      await insertPortalNav('leaderboard', 'Leaderboard', { icon: 'Trophy', sortOrder: 7, route: '/leaderboard' });
+
+      const resources = await insertPortalNav('resources', 'Resources', { icon: 'Folder', sortOrder: 8 });
+      const resourceItems = [
+        ['session-qa', 'Session Q&A', 'MessageCircle'],
+        ['recordings', 'Recordings', 'Video'],
+        ['floormap', 'Floormap', 'Map'],
+        ['logistics', 'Logistics', 'Truck'],
+        ['instagram', 'Instagram', 'Instagram'],
+        ['documents', 'Documents', 'FileText'],
+        ['polls', 'Polls', 'BarChart2'],
+        ['surveys', 'Surveys', 'ClipboardList'],
+        ['twitter', 'Twitter', 'Twitter'],
+        ['confera-guides', 'Confera Guides', 'Compass'],
+      ];
+      for (let i = 0; i < resourceItems.length; i++) {
+        const [key, label, icon] = resourceItems[i];
+        await insertPortalNav(`resources-${key}`, label, { icon, sortOrder: i, parentId: resources });
+      }
+
+      const myStuff = await insertPortalNav('my-stuff', 'My Stuff', { icon: 'Users', sortOrder: 9 });
+      await insertPortalNav('my-agenda', 'My Agenda', { icon: 'Calendar', sortOrder: 0, parentId: myStuff, route: '/my-stuff/agenda' });
+      await insertPortalNav('my-notes', 'My Notes', { icon: 'Edit3', sortOrder: 1, parentId: myStuff, route: '/my-stuff/notes' });
+      await insertPortalNav('profile', 'Profile', { icon: 'User', sortOrder: 2, parentId: myStuff, route: '/my-stuff/profile' });
+
+      await insertPortalNav('feedback-to-confera', 'Feedback to Confera', { icon: 'MessageCircle', sortOrder: 10, route: '/feedback' });
+      await insertPortalNav('organizer-tips', 'Organizer Tips', { icon: 'Lightbulb', sortOrder: 11, route: '/organizer-tips' });
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error(`[portal nav] Failed to seed default nav items for event ${eventId} (non-fatal):`, err.message);
+  }
+}
+
 export async function getPortalNavTree(eventId) {
+  await ensureDefaultPortalNavItems(eventId);
   const { rows } = await pool.query(
     'SELECT * FROM "PortalNavItems" WHERE "EventId" = $1 AND "IsVisible" = true ORDER BY "SortOrder" ASC',
     [eventId]

@@ -592,7 +592,39 @@ export async function getSponsorsForEvent(eventId) {
 }
 
 
+// Sponsor tiers are one global lookup table with no admin UI to manage
+// it yet — "Sponsor Tiering" in the sidebar is still a placeholder
+// page. Historically the only row was a "Gold" tier created
+// defensively by seed.js's demo data, which is why the "New Sponsor"
+// tier dropdown only ever showed "Gold". Every read here makes sure
+// the standard Platinum/Gold/Silver/Bronze set exists (matched
+// case-insensitively by name, so it never duplicates a tier an admin
+// already created) until a real management page exists.
+const DEFAULT_SPONSOR_TIERS = [
+  { name: 'Platinum', sortOrder: 10 },
+  { name: 'Gold', sortOrder: 20 },
+  { name: 'Silver', sortOrder: 30 },
+  { name: 'Bronze', sortOrder: 40 },
+];
+
+async function ensureDefaultSponsorTiers() {
+  for (const tier of DEFAULT_SPONSOR_TIERS) {
+    await pool.query(
+      `INSERT INTO "SponsorTiers" ("Name","SortOrder")
+       SELECT $1,$2 WHERE NOT EXISTS (
+         SELECT 1 FROM "SponsorTiers" WHERE LOWER("Name")=LOWER($1) AND "IsDeleted"=false
+       )`,
+      [tier.name, tier.sortOrder]
+    );
+    await pool.query(
+      `UPDATE "SponsorTiers" SET "SortOrder"=$2 WHERE LOWER("Name")=LOWER($1) AND "IsDeleted"=false`,
+      [tier.name, tier.sortOrder]
+    );
+  }
+}
+
 export async function getSponsorTiers() {
+  await ensureDefaultSponsorTiers();
   const { rows } = await pool.query(
     'SELECT * FROM "SponsorTiers" WHERE "IsDeleted" = false ORDER BY "SortOrder" ASC, "Name" ASC'
   );

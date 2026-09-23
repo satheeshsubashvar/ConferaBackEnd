@@ -1,9 +1,13 @@
 import { Router } from 'express';
+import multer from 'multer';
 import { pool } from '../data/db.js';
 import { requireAuth } from '../middleware/auth.js';
 import { sendPortalInviteIfNeeded } from '../utils/portalInvite.js';
+import { buildExcelHtml, extractRows, rowsToObjects, getCell } from '../utils/excelImportExport.js';
 
 const router = Router({ mergeParams: true });
+const importUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
+const ATTENDEE_HEADERS = ['First Name', 'Last Name', 'Email', 'Company', 'Job Title', 'Role', 'Status'];
 router.use(requireAuth);
 
 async function assertEvent(req) {
@@ -50,49 +54,117 @@ router.post('/', async (req,res,next)=>{
 
 router.get('/',async(req,res,next)=>{try{await assertEvent(req);const r=await pool.query(`SELECT ep."EventParticipantId",ep."Role",ep."Status",ep."Company",ep."JobTitle",ep."RegistrationCode",ep."CheckedInAt",ep."CheckedInBy",ep."CheckInMethod",ep."IsActive",ep."CreatedAt",p."PersonId",p."FirstName",p."LastName",p."FullName",p."Email",p."PhoneNumber",p."ProfilePictureUrl" FROM "EventParticipant" ep JOIN "Person" p ON p."PersonId"=ep."PersonId" WHERE ep."EventId"=$1 AND ep."IsDeleted"=false ORDER BY ep."CreatedAt" DESC`,[req.params.eventId]);res.json(r.rows)}catch(e){next(e)}});
 
-router.post('/import', async (req,res,next)=>{
-  const client = await pool.connect();
+// GET /api/events/:eventId/attendees/template — a real Excel-compatible
+// .xls (see utils/excelImportExport.js) so re-uploading it via /import
+// below always works, unlike the old plain-.csv template this page used
+// to hand out, which broke the moment someone opened it in real Excel
+// and saved over it, or uploaded an actual .xlsx list instead.
+router.get('/template', async (req, res, next) => {
   try {
     await assertEvent(req);
-    const attendees = Array.isArray(req.body?.attendees) ? req.body.attendees : [];
-    if (!attendees.length) return res.status(400).json({error:'No attendees supplied.'});
-    await client.query('BEGIN');
-    const created=[];
-    const invites=[];
-    for (const a of attendees) {
-      const email=String(a.email||'').trim().toLowerCase();
-      if (!email) continue;
-      const firstName=String(a.firstName||'').trim() || 'Attendee';
-      const lastName=String(a.lastName||'').trim() || 'Guest';
-      const fullName=`${firstName} ${lastName}`.trim();
-      const normalized=email.toUpperCase();
-      let person=await client.query('SELECT "PersonId","PasswordHash" FROM "Person" WHERE "NormalizedEmail"=$1 LIMIT 1',[normalized]);
-      let personId, passwordHash;
-      if(person.rowCount) { personId=person.rows[0].PersonId; passwordHash=person.rows[0].PasswordHash; }
-      else {
-        const r=await client.query('INSERT INTO "Person" ("Email","NormalizedEmail","PasswordHash","FirstName","LastName","FullName","Company") VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING "PersonId","PasswordHash"',[email,normalized,'not-a-real-hash-import',firstName,lastName,fullName,a.company||null]);
-        personId=r.rows[0].PersonId; passwordHash=r.rows[0].PasswordHash;
+    res.type('application/vnd.ms-excel');
+    res.set('Content-Disposition', 'attachment; filename="attendees-import-template.xls"');
+    res.send(buildExcelHtml({
+      headers: ATTENDEE_HEADERS,
+      template: true,
+      placeholders: ['John', 'Doe', 'john@example.com', 'Example Ltd', 'Manager', 'Attendee', 'Confirmed'],
+    }));
+  } catch (err) { next(err); }
+});
+
+// GET /api/events/:eventId/attendees/export
+router.get('/export', async (req, res, next) => {
+  try {
+    await assertEvent(req);
+    const r = await pool.query(
+      `SELECT ep."Role",ep."Status",ep."Company",ep."JobTitle",p."FirstName",p."LastName",p."Email" FROM "EventParticipant" ep JOIN "Person" p ON p."PersonId"=ep."PersonId" WHERE ep."EventId"=$1 AND ep."IsDeleted"=false ORDER BY ep."CreatedAt" DESC`,
+      [req.params.eventId]
+    );
+    const rows = r.rows.map((x) => [x.FirstName, x.LastName, x.Email, x.Company, x.JobTitle, x.Role, x.Status]);
+    res.type('application/vnd.ms-excel');
+    res.set('Content-Disposition', `attachment; filename="attendees-${req.params.eventId}.xls"`);
+    res.send(buildExcelHtml({ headers: ATTENDEE_HEADERS, rows }));
+  } catch (err) { next(err); }
+});
+
+// POST /api/events/:eventId/attendees/import — bulk-add attendees from
+// a real uploaded file (the template above, a re-saved-in-Excel copy
+// of it, or a plain CSV/TSV) instead of the old approach of the
+// frontend hand-parsing CSV text client-side and posting JSON — that
+// never understood real .xlsx files (binary bytes fed through a CSV
+// parser produced garbage rows, which then failed the INSERT and 500'd
+// the *entire* import, taking already-imported rows down with it since
+// they all shared one transaction). Each row now gets its own
+// mini-transaction and its own try/catch, matching Exhibitor/Sponsor
+// import: one bad row is reported and skipped, the rest of the batch
+// still goes through.
+router.post('/import', importUpload.single('file'), async (req, res, next) => {
+  try {
+    await assertEvent(req);
+    if (!req.file) return res.status(400).json({ error: 'Please select an Excel/CSV file.' });
+
+    const objects = rowsToObjects(extractRows(req.file.buffer));
+    if (!objects.length) return res.status(400).json({ error: 'The import file contains no attendee rows.' });
+
+    const results = [];
+    const invites = [];
+    for (let i = 0; i < objects.length; i++) {
+      const o = objects[i];
+      const email = getCell(o, 'email').trim().toLowerCase();
+      if (!email) { results.push({ row: i + 2, status: 'Failed', error: 'Missing email address.' }); continue; }
+
+      const firstName = getCell(o, 'first name') || 'Attendee';
+      const lastName = getCell(o, 'last name') || 'Guest';
+      const fullName = `${firstName} ${lastName}`.trim();
+      const company = getCell(o, 'company') || null;
+      const jobTitle = getCell(o, 'job title') || null;
+      const role = getCell(o, 'role') || 'Attendee';
+      const status = getCell(o, 'status') || 'Confirmed';
+
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const normalized = email.toUpperCase();
+        const person = await client.query('SELECT "PersonId","PasswordHash" FROM "Person" WHERE "NormalizedEmail"=$1 LIMIT 1', [normalized]);
+        let personId, passwordHash;
+        if (person.rowCount) {
+          personId = person.rows[0].PersonId; passwordHash = person.rows[0].PasswordHash;
+        } else {
+          const r = await client.query('INSERT INTO "Person" ("Email","NormalizedEmail","PasswordHash","FirstName","LastName","FullName","Company") VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING "PersonId","PasswordHash"', [email, normalized, 'not-a-real-hash-import', firstName, lastName, fullName, company]);
+          personId = r.rows[0].PersonId; passwordHash = r.rows[0].PasswordHash;
+        }
+        const exists = await client.query('SELECT "EventParticipantId" FROM "EventParticipant" WHERE "EventId"=$1 AND "PersonId"=$2 AND "IsDeleted"=false LIMIT 1', [req.params.eventId, personId]);
+        if (exists.rowCount) {
+          await client.query('ROLLBACK');
+          results.push({ row: i + 2, status: 'Failed', error: 'This person is already an attendee for this event.' });
+          continue;
+        }
+        const epRes = await client.query(`INSERT INTO "EventParticipant" ("EventId","PersonId","Role","Company","JobTitle","RegistrationCode","Status") VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING "EventParticipantId"`, [req.params.eventId, personId, role, company, jobTitle, `ATT-${Date.now()}-${i + 1}`, status]);
+        await client.query('COMMIT');
+        results.push({ row: i + 2, status: 'Imported', eventParticipantId: epRes.rows[0].EventParticipantId });
+        invites.push({ personId, email, fullName, passwordHash });
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        results.push({ row: i + 2, status: 'Failed', error: err.message });
+      } finally {
+        client.release();
       }
-      const exists=await client.query('SELECT "EventParticipantId" FROM "EventParticipant" WHERE "EventId"=$1 AND "PersonId"=$2 AND "IsDeleted"=false LIMIT 1',[req.params.eventId,personId]);
-      if(exists.rowCount) continue;
-      const r=await client.query(`INSERT INTO "EventParticipant" ("EventId","PersonId","Role","Company","JobTitle","RegistrationCode","Status") VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING "EventParticipantId"`,[req.params.eventId,personId,a.role||'Attendee',a.company||null,a.jobTitle||null,`ATT-${Date.now()}-${created.length+1}`,a.status||'Confirmed']);
-      created.push(r.rows[0].EventParticipantId);
-      invites.push({personId,email,fullName,passwordHash});
     }
-    await client.query('COMMIT');
-    // Fire after commit, and NOT awaited — this is what made bulk imports
-    // slow. With real SMTP now configured, each invite is a genuine
-    // network round-trip to Gmail (hundreds of ms to a few seconds); an
-    // import of 30+ rows was taking 30+ seconds because every row's email
-    // was sent one at a time before the response could go out. Since
-    // sendPortalInviteIfNeeded never throws (see its own try/catch), there's
-    // nothing to lose by letting all of these run in the background while
-    // the response returns immediately.
+
+    // Fire after all rows are committed, and NOT awaited — see
+    // routes/exhibitors.js / sponsorCenter.js for the same pattern.
+    // sendPortalInviteIfNeeded never throws (its own try/catch), so
+    // there's nothing to lose by letting these run in the background.
     invites.forEach((invite) => {
       sendPortalInviteIfNeeded({ ...invite, eventId: req.params.eventId }).catch(() => {});
     });
-    res.status(201).json({created:created.length});
-  } catch(e){ await client.query('ROLLBACK').catch(()=>{}); next(e); } finally { client.release(); }
+
+    res.status(201).json({
+      imported: results.filter((r) => r.status === 'Imported').length,
+      failed: results.filter((r) => r.status === 'Failed').length,
+      results,
+    });
+  } catch (err) { next(err); }
 });
 
 router.patch('/:id',async(req,res,next)=>{try{

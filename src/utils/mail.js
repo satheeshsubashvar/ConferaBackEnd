@@ -30,6 +30,14 @@ function getTransporter() {
     // nodemailer needs to be told which, it can't detect it.
     secure: port === 465,
     auth: { user: SMTP_USER, pass: SMTP_PASS },
+    // Every call site sends this fire-and-forget (see routes/auth.js,
+    // routes/portalAuth.js), so a hang here no longer blocks an HTTP
+    // response — but without a timeout a flaky network could still
+    // leave sockets open indefinitely. Fail fast and fall back to the
+    // console-log path instead.
+    connectionTimeout: 10_000,
+    greetingTimeout: 10_000,
+    socketTimeout: 10_000,
   });
   cachedTransporterKey = key;
   return cachedTransporter;
@@ -38,12 +46,19 @@ function getTransporter() {
 function emailShell(title, bodyHtml) {
   return `<!DOCTYPE html><html><body style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#f4f4f7;padding:32px 0;margin:0;">
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td align="center">
-      <table role="presentation" width="480" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;padding:32px;max-width:90%;">
-        <tr><td>
-          <p style="font-weight:700;font-style:italic;font-size:20px;color:#4c1d95;margin:0 0 24px;">Confera</p>
-          <h1 style="font-size:18px;margin:0 0 12px;color:#111827;">${title}</h1>
-          ${bodyHtml}
-        </td></tr>
+      <table role="presentation" width="480" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:12px;overflow:hidden;max-width:90%;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+        <tr>
+          <td bgcolor="#4c1d95" style="background-color:#4c1d95;padding:28px 32px;">
+            <span style="font-weight:700;font-style:italic;font-size:22px;color:#ffffff;letter-spacing:0.2px;">Confera</span>
+          </td>
+        </tr>
+        <tr><td style="padding:32px;"><h1 style="font-size:18px;margin:0 0 12px;color:#111827;">${title}</h1>${bodyHtml}</td></tr>
+        <tr>
+          <td bgcolor="#f9fafb" style="background-color:#f9fafb;padding:18px 32px;border-top:1px solid #f0f0f2;">
+            <p style="margin:0;font-size:11px;color:#9ca3af;">Powered by <span style="font-weight:600;color:#6b7280;">BrightMeetups</span></p>
+            <p style="margin:6px 0 0;font-size:11px;color:#c1c5cc;">This is an automated message from Confera — please don't reply directly to this email.</p>
+          </td>
+        </tr>
       </table>
     </td></tr></table>
   </body></html>`;

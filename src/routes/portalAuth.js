@@ -210,7 +210,12 @@ router.post('/forgot-password', async (req, res, next) => {
     await setPasswordResetToken(person.PersonId, token, expiresAt);
 
     const resetUrl = `${portalAppUrl(req)}/reset-password?token=${token}${eventId ? `&eventId=${eventId}` : ''}`;
-    await sendPasswordResetEmail({ to: person.Email, name: person.FullName, resetUrl });
+    // Fire-and-forget, same reasoning as /api/auth/register: don't let
+    // a slow/unreachable SMTP server hang "Forgot password?" forever.
+    // devResetUrl below already gives a working link either way.
+    sendPasswordResetEmail({ to: person.Email, name: person.FullName, resetUrl }).catch((err) => {
+      console.error('[portal-auth/forgot-password] Failed to send reset email:', err.message);
+    });
 
     return res.json({
       ...generic,

@@ -77,7 +77,13 @@ router.post('/register', async (req, res, next) => {
     });
 
     const verifyUrl = `${adminAppUrl(req)}/verify-email?token=${verificationToken}`;
-    await sendVerificationEmail({ to: email, name: `${firstName} ${lastName}`.trim(), verifyUrl });
+    // Fire-and-forget: a slow or unreachable SMTP server must never
+    // block this response, or "Create account" spins forever on the
+    // frontend. devVerifyUrl below is already a working fallback link
+    // regardless of whether the real email goes out.
+    sendVerificationEmail({ to: email, name: `${firstName} ${lastName}`.trim(), verifyUrl }).catch((err) => {
+      console.error('[auth/register] Failed to send verification email:', err.message);
+    });
 
     return res.status(201).json({
       personId,
@@ -135,7 +141,9 @@ router.post('/resend-verification', async (req, res, next) => {
     await setEmailVerificationToken(person.PersonId, verificationToken, verificationExpiresAt);
 
     const verifyUrl = `${adminAppUrl(req)}/verify-email?token=${verificationToken}`;
-    await sendVerificationEmail({ to: person.Email, name: person.FullName, verifyUrl });
+    sendVerificationEmail({ to: person.Email, name: person.FullName, verifyUrl }).catch((err) => {
+      console.error('[auth/resend-verification] Failed to send verification email:', err.message);
+    });
 
     return res.json({ ...generic, devVerifyUrl: verifyUrl });
   } catch (err) {

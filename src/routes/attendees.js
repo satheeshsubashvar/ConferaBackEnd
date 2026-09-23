@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { pool } from '../data/db.js';
 import { requireAuth } from '../middleware/auth.js';
+import { sendPortalInviteIfNeeded } from '../utils/portalInvite.js';
 
 const router = Router({ mergeParams: true });
 router.use(requireAuth);
@@ -36,6 +37,10 @@ router.post('/', async (req,res,next)=>{
     if(exists.rowCount) { await client.query('ROLLBACK'); return res.status(409).json({error:'This person is already an attendee for this event.'}); }
     const ep=await client.query(`INSERT INTO "EventParticipant" ("EventId","PersonId","Role","Company","JobTitle","RegistrationCode","Status") VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,[req.params.eventId,personRow.PersonId,b.role||'Attendee',b.company||null,b.jobTitle||null,`ATT-${Date.now()}`,b.status||'Confirmed']);
     await client.query('COMMIT');
+    await sendPortalInviteIfNeeded({
+      personId: personRow.PersonId, email: personRow.Email, fullName: personRow.FullName,
+      passwordHash: personRow.PasswordHash, eventId: req.params.eventId,
+    });
     res.status(201).json({EventParticipantId:ep.rows[0].EventParticipantId,PersonId:personRow.PersonId,Role:ep.rows[0].Role,Status:ep.rows[0].Status,Company:ep.rows[0].Company,JobTitle:ep.rows[0].JobTitle,FullName:personRow.FullName,FirstName:personRow.FirstName,LastName:personRow.LastName,Email:personRow.Email,ProfilePictureUrl:personRow.ProfilePictureUrl,IsActive:ep.rows[0].IsActive});
   } catch(e){await client.query('ROLLBACK').catch(()=>{});next(e)} finally{client.release()}
 });
@@ -50,25 +55,34 @@ router.post('/import', async (req,res,next)=>{
     if (!attendees.length) return res.status(400).json({error:'No attendees supplied.'});
     await client.query('BEGIN');
     const created=[];
+    const invites=[];
     for (const a of attendees) {
       const email=String(a.email||'').trim().toLowerCase();
       if (!email) continue;
       const firstName=String(a.firstName||'').trim() || 'Attendee';
       const lastName=String(a.lastName||'').trim() || 'Guest';
+      const fullName=`${firstName} ${lastName}`.trim();
       const normalized=email.toUpperCase();
-      let person=await client.query('SELECT "PersonId" FROM "Person" WHERE "NormalizedEmail"=$1 LIMIT 1',[normalized]);
-      let personId;
-      if(person.rowCount) personId=person.rows[0].PersonId;
+      let person=await client.query('SELECT "PersonId","PasswordHash" FROM "Person" WHERE "NormalizedEmail"=$1 LIMIT 1',[normalized]);
+      let personId, passwordHash;
+      if(person.rowCount) { personId=person.rows[0].PersonId; passwordHash=person.rows[0].PasswordHash; }
       else {
-        const r=await client.query('INSERT INTO "Person" ("Email","NormalizedEmail","PasswordHash","FirstName","LastName","FullName","Company") VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING "PersonId"',[email,normalized,'not-a-real-hash-import',firstName,lastName,`${firstName} ${lastName}`.trim(),a.company||null]);
-        personId=r.rows[0].PersonId;
+        const r=await client.query('INSERT INTO "Person" ("Email","NormalizedEmail","PasswordHash","FirstName","LastName","FullName","Company") VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING "PersonId","PasswordHash"',[email,normalized,'not-a-real-hash-import',firstName,lastName,fullName,a.company||null]);
+        personId=r.rows[0].PersonId; passwordHash=r.rows[0].PasswordHash;
       }
       const exists=await client.query('SELECT "EventParticipantId" FROM "EventParticipant" WHERE "EventId"=$1 AND "PersonId"=$2 AND "IsDeleted"=false LIMIT 1',[req.params.eventId,personId]);
       if(exists.rowCount) continue;
       const r=await client.query(`INSERT INTO "EventParticipant" ("EventId","PersonId","Role","Company","JobTitle","RegistrationCode","Status") VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING "EventParticipantId"`,[req.params.eventId,personId,a.role||'Attendee',a.company||null,a.jobTitle||null,`ATT-${Date.now()}-${created.length+1}`,a.status||'Confirmed']);
       created.push(r.rows[0].EventParticipantId);
+      invites.push({personId,email,fullName,passwordHash});
     }
     await client.query('COMMIT');
+    // Fire after commit, sequentially — one broken invite (bad email,
+    // send failure) should never roll back or block the rest of the
+    // import, and sendPortalInviteIfNeeded already never throws.
+    for (const invite of invites) {
+      await sendPortalInviteIfNeeded({ ...invite, eventId: req.params.eventId });
+    }
     res.status(201).json({created:created.length});
   } catch(e){ await client.query('ROLLBACK').catch(()=>{}); next(e); } finally { client.release(); }
 });

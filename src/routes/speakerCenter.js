@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import multer from 'multer';
+import * as XLSX from 'xlsx';
 import {
   getEventById,
   getSpeakersForEventFull,
@@ -129,6 +130,44 @@ function parseHtmlTable(text) {
   );
 }
 
+// Turns the uploaded file's raw bytes into an array of row arrays,
+// however it was actually saved.
+//
+// The failure mode this fixes: "Import Speakers" didn't work for the
+// normal, expected workflow — download the template, fill it in in
+// Excel, re-upload it. Our "template.xls" is really an HTML table
+// wearing an .xls extension (buildExcelHtml() above); Excel opens
+// that fine, but the moment someone hits Save, Excel converts it into
+// a REAL binary .xls/.xlsx file. The old code only knew how to read
+// plain text (CSV/TSV) or an HTML <table> — handed a real binary
+// spreadsheet, it read gibberish, so every row failed validation and
+// the import silently reported 0 imported / all failed with no clue
+// why. Speakers added one at a time worked fine, which is why this
+// looked like an "import" bug specifically.
+function extractRows(buffer) {
+  // 1) Try it as a real spreadsheet first — this also transparently
+  //    handles plain CSV, so it covers the large majority of cases.
+  try {
+    const workbook = XLSX.read(buffer, { type: 'buffer' });
+    const sheetName = workbook.SheetNames[0];
+    if (sheetName) {
+      const rows = XLSX.utils
+        .sheet_to_json(workbook.Sheets[sheetName], { header: 1, raw: false, defval: '' })
+        .map((row) => row.map((cell) => String(cell ?? '').trim()))
+        .filter((row) => row.some((cell) => cell !== ''));
+      if (rows.length) return rows;
+    }
+  } catch {
+    // Not a format SheetJS recognizes (e.g. our own HTML-flavored
+    // .xls, opened but never re-saved) — fall through below.
+  }
+
+  // 2) Fall back to the original text-based readers: our own
+  //     HTML-table export/template, or a hand-written CSV/TSV.
+  const text = buffer.toString('utf8');
+  return /<table/i.test(text) ? parseHtmlTable(text) : parseDelimited(text);
+}
+
 function rowsToObjects(rows) {
   if (!rows.length) return [];
   const headers = rows[0].map((h) => h.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim());
@@ -185,8 +224,7 @@ router.post('/import', importUpload.single('file'), async (req, res, next) => {
     if (!event) return;
     if (!req.file) return res.status(400).json({ error: 'Please select an Excel/CSV file.' });
 
-    const text = req.file.buffer.toString('utf8');
-    const rows = /<table/i.test(text) ? parseHtmlTable(text) : parseDelimited(text);
+    const rows = extractRows(req.file.buffer);
     const objects = rowsToObjects(rows);
     if (!objects.length) return res.status(400).json({ error: 'The import file contains no speaker rows.' });
 

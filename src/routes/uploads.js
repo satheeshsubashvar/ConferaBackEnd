@@ -21,7 +21,7 @@ router.post('/image', (req, res) => {
       return res.status(400).json({ error: 'No file was uploaded.' });
     }
 
-    const url = buildUploadUrl(req.file.filename);
+    const url = buildUploadUrl(req.file.filename, req);
     res.status(201).json({
       url,
       filename: req.file.filename,
@@ -38,7 +38,7 @@ router.post('/video', (req, res) => {
     if (err) return res.status(400).json({ error: err.message });
     if (!req.file) return res.status(400).json({ error: 'No video was uploaded.' });
     res.status(201).json({
-      url: buildUploadUrl(req.file.filename),
+      url: buildUploadUrl(req.file.filename, req),
       filename: req.file.filename,
       sizeBytes: req.file.size,
       mimeType: req.file.mimetype,
@@ -58,7 +58,7 @@ router.post('/document', (req, res) => {
       return res.status(400).json({ error: 'No file was uploaded.' });
     }
 
-    const url = buildUploadUrl(req.file.filename);
+    const url = buildUploadUrl(req.file.filename, req);
     res.status(201).json({
       url,
       filename: req.file.filename,

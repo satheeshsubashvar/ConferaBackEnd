@@ -1,8 +1,11 @@
 import { Router } from 'express';
+import multer from 'multer';
 import { pool } from '../data/db.js';
 import { requireAuth } from '../middleware/auth.js';
+import { buildExcelHtml, extractRows, rowsToObjects, getCell, parseBoolCell } from '../utils/excelImportExport.js';
 
 const router = Router({ mergeParams: true });
+const importUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 router.use(requireAuth);
 
 async function assertEvent(req) {
@@ -24,11 +27,156 @@ router.post('/announcements', async (req,res,next)=>{try{await assertEvent(req);
 router.patch('/announcements/:id', async(req,res,next)=>{try{await assertEvent(req);const b=req.body||{};const fields={title:'Title',content:'Content',summary:'Summary',announcementType:'AnnouncementType',priority:'Priority',targetAudience:'TargetAudience',targetSegmentsJson:'TargetSegmentsJson',isPushNotification:'IsPushNotification',isEmail:'IsEmail',isInApp:'IsInApp',isPublished:'IsPublished',expiresAt:'ExpiresAt',actionButtonText:'ActionButtonText',actionButtonUrl:'ActionButtonUrl'};const sets=[];const vals=[req.params.eventId,req.params.id];for(const [k,c] of Object.entries(fields)){if(b[k]!==undefined){sets.push(`"${c}"=$${vals.length+1}`);vals.push(b[k]);}}if(b.isPublished===true)sets.push(`"PublishedAt"=(now() AT TIME ZONE 'utc')`);if(!sets.length)return res.status(400).json({error:'No changes supplied.'});const r=await pool.query(`UPDATE "Announcements" SET ${sets.join(', ')} WHERE "EventId"=$1 AND "AnnouncementId"=$2 AND "IsDeleted"=false RETURNING *`,vals);if(!r.rowCount)return res.status(404).json({error:'Announcement not found.'});res.json(row(r));}catch(e){next(e);}});
 router.delete('/announcements/:id', async(req,res,next)=>{try{await assertEvent(req);const r=await pool.query(`UPDATE "Announcements" SET "IsDeleted"=true,"DeletedAt"=(now() AT TIME ZONE 'utc'),"DeletedBy"=$3 WHERE "EventId"=$1 AND "AnnouncementId"=$2 AND "IsDeleted"=false RETURNING "AnnouncementId"`,[req.params.eventId,req.params.id,req.user.sub]);if(!r.rowCount)return res.status(404).json({error:'Announcement not found.'});res.json({ok:true});}catch(e){next(e);}});
 
+// Announcements — bulk Excel add
+const ANNOUNCEMENT_HEADERS = [
+  'Title', 'Content', 'Summary', 'Type', 'Priority (1-5)', 'Target Audience',
+  'Push Notification (Yes/No)', 'Email (Yes/No)', 'In-App (Yes/No)',
+  'Published (Yes/No)', 'Expires At', 'Action Button Text', 'Action Button URL',
+];
+router.get('/announcements/template', async (req, res, next) => {
+  try {
+    await assertEvent(req);
+    res.type('application/vnd.ms-excel');
+    res.set('Content-Disposition', 'attachment; filename="announcement-import-template.xls"');
+    res.send(buildExcelHtml({ headers: ANNOUNCEMENT_HEADERS, template: true }));
+  } catch (e) { next(e); }
+});
+router.get('/announcements/export', async (req, res, next) => {
+  try {
+    await assertEvent(req);
+    const r = await pool.query(`SELECT * FROM "Announcements" WHERE "EventId"=$1 AND "IsDeleted"=false ORDER BY "Priority" DESC, "CreatedAt" DESC`, [req.params.eventId]);
+    const exportRows = rows(r).map((a) => [
+      a.Title, a.Content, a.Summary, a.AnnouncementType, a.Priority, a.TargetAudience,
+      a.IsPushNotification ? 'Yes' : 'No', a.IsEmail ? 'Yes' : 'No', a.IsInApp ? 'Yes' : 'No',
+      a.IsPublished ? 'Yes' : 'No', a.ExpiresAt, a.ActionButtonText, a.ActionButtonUrl,
+    ]);
+    res.type('application/vnd.ms-excel');
+    res.set('Content-Disposition', 'attachment; filename="announcements.xls"');
+    res.send(buildExcelHtml({ headers: ANNOUNCEMENT_HEADERS, rows: exportRows }));
+  } catch (e) { next(e); }
+});
+router.post('/announcements/import', importUpload.single('file'), async (req, res, next) => {
+  try {
+    await assertEvent(req);
+    if (!req.file) return res.status(400).json({ error: 'Please select an Excel/CSV file.' });
+    const objects = rowsToObjects(extractRows(req.file.buffer));
+    if (!objects.length) return res.status(400).json({ error: 'The import file contains no announcement rows.' });
+
+    const results = [];
+    for (let i = 0; i < objects.length; i++) {
+      const o = objects[i];
+      const title = getCell(o, 'title');
+      const content = getCell(o, 'content');
+      if (!title || !content) {
+        results.push({ row: i + 2, status: 'Failed', error: 'Title and Content are required.' });
+        continue;
+      }
+      try {
+        const r = await pool.query(
+          `INSERT INTO "Announcements" ("EventId","Title","Content","Summary","AnnouncementType","Priority","TargetAudience","IsPushNotification","IsEmail","IsInApp","IsPublished","PublishedAt","ExpiresAt","ActionButtonText","ActionButtonUrl","CreatedByPersonId")
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,(now() AT TIME ZONE 'utc'),$12,$13,$14,$15) RETURNING "AnnouncementId"`,
+          [
+            req.params.eventId, title, content, getCell(o, 'summary') || null,
+            getCell(o, 'type') || 'General', Number(getCell(o, 'priority')) || 1,
+            getCell(o, 'target audience') || 'All',
+            parseBoolCell(getCell(o, 'push notification')) ?? false,
+            parseBoolCell(getCell(o, 'email')) ?? false,
+            parseBoolCell(getCell(o, 'in app')) ?? true,
+            parseBoolCell(getCell(o, 'published')) ?? true,
+            getCell(o, 'expires at') || null,
+            getCell(o, 'action button text') || null,
+            getCell(o, 'action button url') || null,
+            req.user.sub,
+          ]
+        );
+        results.push({ row: i + 2, status: 'Imported', announcementId: r.rows[0].AnnouncementId });
+      } catch (err) {
+        results.push({ row: i + 2, status: 'Failed', error: err.message });
+      }
+    }
+    res.json({ imported: results.filter((r) => r.status === 'Imported').length, failed: results.filter((r) => r.status === 'Failed').length, results });
+  } catch (e) { next(e); }
+});
+
 // Meet-ups
 router.get('/meetups', async(req,res,next)=>{try{await assertEvent(req);const r=await pool.query(`SELECT * FROM "Meetups" WHERE "EventId"=$1 AND "IsDeleted"=false ORDER BY "StartTime"`,[req.params.eventId]);res.json(rows(r));}catch(e){next(e);}});
 router.post('/meetups',async(req,res,next)=>{try{await assertEvent(req);const b=req.body||{};const r=await pool.query(`INSERT INTO "Meetups" ("EventId","OrganizerPersonId","Title","Description","MeetupType","Location","VirtualMeetingUrl","StartTime","EndTime","MaxAttendees","IsPrivate","AccessCode","Status") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,[req.params.eventId,req.user.sub,b.title,b.description||null,b.meetupType||'Virtual',b.location||null,b.virtualMeetingUrl||null,b.startTime,b.endTime,b.maxAttendees?Number(b.maxAttendees):null,!!b.isPrivate,b.accessCode||null,b.status||'Scheduled']);res.status(201).json(row(r));}catch(e){next(e);}});
 router.patch('/meetups/:id',async(req,res,next)=>{try{await assertEvent(req);const b=req.body||{};const map={title:'Title',description:'Description',meetupType:'MeetupType',location:'Location',virtualMeetingUrl:'VirtualMeetingUrl',startTime:'StartTime',endTime:'EndTime',maxAttendees:'MaxAttendees',isPrivate:'IsPrivate',accessCode:'AccessCode',status:'Status'};const sets=[];const vals=[req.params.eventId,req.params.id];for(const[k,c]of Object.entries(map)){if(b[k]!==undefined){sets.push(`"${c}"=$${vals.length+1}`);vals.push(b[k]);}}sets.push(`"UpdatedAt"=(now() AT TIME ZONE 'utc')`);const r=await pool.query(`UPDATE "Meetups" SET ${sets.join(',')} WHERE "EventId"=$1 AND "MeetupId"=$2 AND "IsDeleted"=false RETURNING *`,vals);if(!r.rowCount)return res.status(404).json({error:'Meet-up not found.'});res.json(row(r));}catch(e){next(e);}});
 router.delete('/meetups/:id',async(req,res,next)=>{try{await assertEvent(req);const r=await pool.query(`UPDATE "Meetups" SET "IsDeleted"=true,"DeletedAt"=(now() AT TIME ZONE 'utc'),"DeletedBy"=$3 WHERE "EventId"=$1 AND "MeetupId"=$2 AND "IsDeleted"=false RETURNING "MeetupId"`,[req.params.eventId,req.params.id,req.user.sub]);if(!r.rowCount)return res.status(404).json({error:'Meet-up not found.'});res.json({ok:true});}catch(e){next(e);}});
+
+// Meet-ups — bulk Excel add
+const MEETUP_HEADERS = [
+  'Title', 'Description', 'Type', 'Location', 'Virtual Meeting URL',
+  'Start Time', 'End Time', 'Max Attendees', 'Private (Yes/No)', 'Access Code', 'Status',
+];
+router.get('/meetups/template', async (req, res, next) => {
+  try {
+    await assertEvent(req);
+    res.type('application/vnd.ms-excel');
+    res.set('Content-Disposition', 'attachment; filename="meetup-import-template.xls"');
+    res.send(buildExcelHtml({
+      headers: MEETUP_HEADERS,
+      template: true,
+      placeholders: [
+        'Title', 'Description', 'Type', 'Location', 'Virtual Meeting URL',
+        '2026-03-15 09:00', '2026-03-15 10:00', 'Max Attendees', 'No', 'Access Code', 'Scheduled',
+      ],
+    }));
+  } catch (e) { next(e); }
+});
+router.get('/meetups/export', async (req, res, next) => {
+  try {
+    await assertEvent(req);
+    const r = await pool.query(`SELECT * FROM "Meetups" WHERE "EventId"=$1 AND "IsDeleted"=false ORDER BY "StartTime"`, [req.params.eventId]);
+    const exportRows = rows(r).map((m) => [
+      m.Title, m.Description, m.MeetupType, m.Location, m.VirtualMeetingUrl,
+      m.StartTime, m.EndTime, m.MaxAttendees, m.IsPrivate ? 'Yes' : 'No', m.AccessCode, m.Status,
+    ]);
+    res.type('application/vnd.ms-excel');
+    res.set('Content-Disposition', 'attachment; filename="meetups.xls"');
+    res.send(buildExcelHtml({ headers: MEETUP_HEADERS, rows: exportRows }));
+  } catch (e) { next(e); }
+});
+router.post('/meetups/import', importUpload.single('file'), async (req, res, next) => {
+  try {
+    await assertEvent(req);
+    if (!req.file) return res.status(400).json({ error: 'Please select an Excel/CSV file.' });
+    const objects = rowsToObjects(extractRows(req.file.buffer));
+    if (!objects.length) return res.status(400).json({ error: 'The import file contains no meet-up rows.' });
+
+    const results = [];
+    for (let i = 0; i < objects.length; i++) {
+      const o = objects[i];
+      const title = getCell(o, 'title');
+      const startTime = getCell(o, 'start time');
+      const endTime = getCell(o, 'end time');
+      if (!title || !startTime || !endTime) {
+        results.push({ row: i + 2, status: 'Failed', error: 'Title, Start Time, and End Time are required.' });
+        continue;
+      }
+      try {
+        const maxAttendees = getCell(o, 'max attendees');
+        const r = await pool.query(
+          `INSERT INTO "Meetups" ("EventId","OrganizerPersonId","Title","Description","MeetupType","Location","VirtualMeetingUrl","StartTime","EndTime","MaxAttendees","IsPrivate","AccessCode","Status")
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING "MeetupId"`,
+          [
+            req.params.eventId, req.user.sub, title, getCell(o, 'description') || null,
+            getCell(o, 'type') || 'Virtual', getCell(o, 'location') || null,
+            getCell(o, 'virtual meeting url') || null, startTime, endTime,
+            maxAttendees ? Number(maxAttendees) : null,
+            parseBoolCell(getCell(o, 'private')) ?? false,
+            getCell(o, 'access code') || null,
+            getCell(o, 'status') || 'Scheduled',
+          ]
+        );
+        results.push({ row: i + 2, status: 'Imported', meetupId: r.rows[0].MeetupId });
+      } catch (err) {
+        results.push({ row: i + 2, status: 'Failed', error: err.message });
+      }
+    }
+    res.json({ imported: results.filter((r) => r.status === 'Imported').length, failed: results.filter((r) => r.status === 'Failed').length, results });
+  } catch (e) { next(e); }
+});
 
 // Discussion topics
 router.get('/discussion-topics',async(req,res,next)=>{try{await assertEvent(req);const r=await pool.query(`SELECT d.*, COALESCE(p."FullName", p."Email", 'Admin') AS "CreatedByName" FROM "DiscussionTopics" d LEFT JOIN "Person" p ON p."PersonId"=d."CreatedByPersonId" WHERE d."EventId"=$1 AND d."IsDeleted"=false ORDER BY d."IsPinned" DESC,d."CreatedAt" DESC`,[req.params.eventId]);res.json(rows(r));}catch(e){next(e);}});
@@ -36,11 +184,137 @@ router.post('/discussion-topics',async(req,res,next)=>{try{await assertEvent(req
 router.patch('/discussion-topics/:id',async(req,res,next)=>{try{await assertEvent(req);const b=req.body||{};const map={title:'Title',content:'Content',category:'Category',isPinned:'IsPinned',isLocked:'IsLocked',isApproved:'IsApproved',tags:'Tags'};const sets=[];const vals=[req.params.eventId,req.params.id];for(const[k,c]of Object.entries(map)){if(b[k]!==undefined){sets.push(`"${c}"=$${vals.length+1}`);vals.push(b[k]);}}sets.push(`"UpdatedAt"=(now() AT TIME ZONE 'utc')`);const r=await pool.query(`UPDATE "DiscussionTopics" SET ${sets.join(',')} WHERE "EventId"=$1 AND "TopicId"=$2 AND "IsDeleted"=false RETURNING *`,vals);if(!r.rowCount)return res.status(404).json({error:'Discussion topic not found.'});res.json(row(r));}catch(e){next(e);}});
 router.delete('/discussion-topics/:id',async(req,res,next)=>{try{await assertEvent(req);const r=await pool.query(`UPDATE "DiscussionTopics" SET "IsDeleted"=true,"DeletedAt"=(now() AT TIME ZONE 'utc'),"DeletedBy"=$3 WHERE "EventId"=$1 AND "TopicId"=$2 AND "IsDeleted"=false RETURNING "TopicId"`,[req.params.eventId,req.params.id,req.user.sub]);if(!r.rowCount)return res.status(404).json({error:'Discussion topic not found.'});res.json({ok:true});}catch(e){next(e);}});
 
+// Discussion topics — bulk Excel add
+const DISCUSSION_HEADERS = [
+  'Title', 'Content', 'Category', 'Pinned (Yes/No)', 'Locked (Yes/No)',
+  'Approved (Yes/No)', 'Tags',
+];
+router.get('/discussion-topics/template', async (req, res, next) => {
+  try {
+    await assertEvent(req);
+    res.type('application/vnd.ms-excel');
+    res.set('Content-Disposition', 'attachment; filename="discussion-topic-import-template.xls"');
+    res.send(buildExcelHtml({ headers: DISCUSSION_HEADERS, template: true }));
+  } catch (e) { next(e); }
+});
+router.get('/discussion-topics/export', async (req, res, next) => {
+  try {
+    await assertEvent(req);
+    const r = await pool.query(`SELECT * FROM "DiscussionTopics" WHERE "EventId"=$1 AND "IsDeleted"=false ORDER BY "IsPinned" DESC,"CreatedAt" DESC`, [req.params.eventId]);
+    const exportRows = rows(r).map((t) => [
+      t.Title, t.Content, t.Category, t.IsPinned ? 'Yes' : 'No', t.IsLocked ? 'Yes' : 'No',
+      t.IsApproved ? 'Yes' : 'No', t.Tags,
+    ]);
+    res.type('application/vnd.ms-excel');
+    res.set('Content-Disposition', 'attachment; filename="discussion-topics.xls"');
+    res.send(buildExcelHtml({ headers: DISCUSSION_HEADERS, rows: exportRows }));
+  } catch (e) { next(e); }
+});
+router.post('/discussion-topics/import', importUpload.single('file'), async (req, res, next) => {
+  try {
+    await assertEvent(req);
+    if (!req.file) return res.status(400).json({ error: 'Please select an Excel/CSV file.' });
+    const objects = rowsToObjects(extractRows(req.file.buffer));
+    if (!objects.length) return res.status(400).json({ error: 'The import file contains no discussion topic rows.' });
+
+    const results = [];
+    for (let i = 0; i < objects.length; i++) {
+      const o = objects[i];
+      const title = getCell(o, 'title');
+      const content = getCell(o, 'content');
+      if (!title || !content) {
+        results.push({ row: i + 2, status: 'Failed', error: 'Title and Content are required.' });
+        continue;
+      }
+      try {
+        const r = await pool.query(
+          `INSERT INTO "DiscussionTopics" ("EventId","CreatedByPersonId","Title","Content","Category","IsPinned","IsLocked","IsApproved","Tags")
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING "TopicId"`,
+          [
+            req.params.eventId, req.user.sub, title, content,
+            getCell(o, 'category') || null,
+            parseBoolCell(getCell(o, 'pinned')) ?? false,
+            parseBoolCell(getCell(o, 'locked')) ?? false,
+            parseBoolCell(getCell(o, 'approved')) ?? true,
+            getCell(o, 'tags') || null,
+          ]
+        );
+        results.push({ row: i + 2, status: 'Imported', topicId: r.rows[0].TopicId });
+      } catch (err) {
+        results.push({ row: i + 2, status: 'Failed', error: err.message });
+      }
+    }
+    res.json({ imported: results.filter((r) => r.status === 'Imported').length, failed: results.filter((r) => r.status === 'Failed').length, results });
+  } catch (e) { next(e); }
+});
+
 // Social groups
 router.get('/social-groups',async(req,res,next)=>{try{await assertEvent(req);const r=await pool.query(`SELECT * FROM "SocialGroups" WHERE "EventId"=$1 AND "IsDeleted"=false ORDER BY "CreatedAt" DESC`,[req.params.eventId]);res.json(rows(r));}catch(e){next(e);}});
 router.post('/social-groups',async(req,res,next)=>{try{await assertEvent(req);const b=req.body||{};const r=await pool.query(`INSERT INTO "SocialGroups" ("EventId","OwnerPersonId","Name","Description","GroupType","Privacy","AccessCode","AvatarUrl","CoverImageUrl","IsActive") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,[req.params.eventId,req.user.sub,b.name,b.description||null,b.groupType||'Interest',b.privacy||'Public',b.accessCode||null,b.avatarUrl||null,b.coverImageUrl||null,b.isActive!==false]);res.status(201).json(row(r));}catch(e){next(e);}});
 router.patch('/social-groups/:id',async(req,res,next)=>{try{await assertEvent(req);const b=req.body||{};const map={name:'Name',description:'Description',groupType:'GroupType',privacy:'Privacy',accessCode:'AccessCode',avatarUrl:'AvatarUrl',coverImageUrl:'CoverImageUrl',isActive:'IsActive'};const sets=[];const vals=[req.params.eventId,req.params.id];for(const[k,c]of Object.entries(map)){if(b[k]!==undefined){sets.push(`"${c}"=$${vals.length+1}`);vals.push(b[k]);}}sets.push(`"UpdatedAt"=(now() AT TIME ZONE 'utc')`);const r=await pool.query(`UPDATE "SocialGroups" SET ${sets.join(',')} WHERE "EventId"=$1 AND "GroupId"=$2 AND "IsDeleted"=false RETURNING *`,vals);if(!r.rowCount)return res.status(404).json({error:'Social group not found.'});res.json(row(r));}catch(e){next(e);}});
 router.delete('/social-groups/:id',async(req,res,next)=>{try{await assertEvent(req);const r=await pool.query(`UPDATE "SocialGroups" SET "IsDeleted"=true,"DeletedAt"=(now() AT TIME ZONE 'utc'),"DeletedBy"=$3 WHERE "EventId"=$1 AND "GroupId"=$2 AND "IsDeleted"=false RETURNING "GroupId"`,[req.params.eventId,req.params.id,req.user.sub]);if(!r.rowCount)return res.status(404).json({error:'Social group not found.'});res.json({ok:true});}catch(e){next(e);}});
+
+// Social groups — bulk Excel add
+const SOCIAL_GROUP_HEADERS = [
+  'Name', 'Description', 'Type', 'Privacy', 'Access Code', 'Avatar URL',
+  'Cover Image URL', 'Active (Yes/No)',
+];
+router.get('/social-groups/template', async (req, res, next) => {
+  try {
+    await assertEvent(req);
+    res.type('application/vnd.ms-excel');
+    res.set('Content-Disposition', 'attachment; filename="social-group-import-template.xls"');
+    res.send(buildExcelHtml({ headers: SOCIAL_GROUP_HEADERS, template: true }));
+  } catch (e) { next(e); }
+});
+router.get('/social-groups/export', async (req, res, next) => {
+  try {
+    await assertEvent(req);
+    const r = await pool.query(`SELECT * FROM "SocialGroups" WHERE "EventId"=$1 AND "IsDeleted"=false ORDER BY "CreatedAt" DESC`, [req.params.eventId]);
+    const exportRows = rows(r).map((g) => [
+      g.Name, g.Description, g.GroupType, g.Privacy, g.AccessCode, g.AvatarUrl,
+      g.CoverImageUrl, g.IsActive ? 'Yes' : 'No',
+    ]);
+    res.type('application/vnd.ms-excel');
+    res.set('Content-Disposition', 'attachment; filename="social-groups.xls"');
+    res.send(buildExcelHtml({ headers: SOCIAL_GROUP_HEADERS, rows: exportRows }));
+  } catch (e) { next(e); }
+});
+router.post('/social-groups/import', importUpload.single('file'), async (req, res, next) => {
+  try {
+    await assertEvent(req);
+    if (!req.file) return res.status(400).json({ error: 'Please select an Excel/CSV file.' });
+    const objects = rowsToObjects(extractRows(req.file.buffer));
+    if (!objects.length) return res.status(400).json({ error: 'The import file contains no social group rows.' });
+
+    const results = [];
+    for (let i = 0; i < objects.length; i++) {
+      const o = objects[i];
+      const name = getCell(o, 'name');
+      if (!name) {
+        results.push({ row: i + 2, status: 'Failed', error: 'Name is required.' });
+        continue;
+      }
+      try {
+        const r = await pool.query(
+          `INSERT INTO "SocialGroups" ("EventId","OwnerPersonId","Name","Description","GroupType","Privacy","AccessCode","AvatarUrl","CoverImageUrl","IsActive")
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING "GroupId"`,
+          [
+            req.params.eventId, req.user.sub, name, getCell(o, 'description') || null,
+            getCell(o, 'type') || 'Interest', getCell(o, 'privacy') || 'Public',
+            getCell(o, 'access code') || null, getCell(o, 'avatar url') || null,
+            getCell(o, 'cover image url') || null,
+            parseBoolCell(getCell(o, 'active')) ?? true,
+          ]
+        );
+        results.push({ row: i + 2, status: 'Imported', groupId: r.rows[0].GroupId });
+      } catch (err) {
+        results.push({ row: i + 2, status: 'Failed', error: err.message });
+      }
+    }
+    res.json({ imported: results.filter((r) => r.status === 'Imported').length, failed: results.filter((r) => r.status === 'Failed').length, results });
+  } catch (e) { next(e); }
+});
 
 // Gamification: event badges + global action catalog
 router.get('/gamification',async(req,res,next)=>{try{await assertEvent(req);const [a,b]=await Promise.all([pool.query(`SELECT * FROM "GamificationActions" WHERE "IsDeleted"=false ORDER BY "ActionName"`),pool.query(`SELECT * FROM "Badges" WHERE "EventId"=$1 AND "IsDeleted"=false ORDER BY "SortOrder","BadgeName"`,[req.params.eventId])]);res.json({actions:a.rows,badges:b.rows});}catch(e){next(e);}});
@@ -56,6 +330,82 @@ async function listSurveys(req,res,next,feedbackOnly=false){try{await assertEven
 router.get('/surveys',(req,res,next)=>listSurveys(req,res,next,false));
 router.get('/session-feedback',(req,res,next)=>listSurveys(req,res,next,true));
 router.post('/surveys',async(req,res,next)=>{try{await assertEvent(req);const b=req.body||{};const r=await pool.query(`INSERT INTO "SurveyTemplates" ("EventId","SessionId","Title","Description","SurveyType","IsAnonymous","IsActive","OpensAt","ClosesAt","CreatedByPersonId") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,[req.params.eventId,b.sessionId||null,b.title,b.description||null,b.surveyType||'Custom',!!b.isAnonymous,b.isActive!==false,b.opensAt||null,b.closesAt||null,req.user.sub]);const id=r.rows[0].SurveyTemplateId;if(Array.isArray(b.questions)){for(let i=0;i<b.questions.length;i++){const q=b.questions[i];const qr=await pool.query(`INSERT INTO "SurveyQuestions" ("SurveyTemplateId","QuestionText","QuestionType","IsRequired","SortOrder","MinRating","MaxRating") VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING "SurveyQuestionId"`,[id,q.questionText,q.questionType||'Text',!!q.isRequired,i,q.minRating??null,q.maxRating??null]);if(Array.isArray(q.options)){for(let j=0;j<q.options.length;j++)await pool.query(`INSERT INTO "SurveyQuestionOptions" ("SurveyQuestionId","Label","SortOrder") VALUES ($1,$2,$3)`,[qr.rows[0].SurveyQuestionId,q.options[j],j]);}}}res.status(201).json(r.rows[0]);}catch(e){next(e);}});
+// Surveys — bulk Excel add. Only the survey shell (title, description,
+// type, etc.) is imported this way — questions have their own
+// nested structure (type, options, min/max rating) that doesn't fit a
+// flat spreadsheet row, so they're still added in the Survey Builder
+// after an imported survey appears in the list. IMPORTANT: these
+// literal-path routes must stay registered before GET /surveys/:id
+// below, or Express would treat "template"/"export" as an :id value
+// and this code would never run.
+const SURVEY_HEADERS = [
+  'Title', 'Description', 'Type', 'Anonymous (Yes/No)', 'Active (Yes/No)',
+  'Opens At', 'Closes At',
+];
+router.get('/surveys/template', async (req, res, next) => {
+  try {
+    await assertEvent(req);
+    res.type('application/vnd.ms-excel');
+    res.set('Content-Disposition', 'attachment; filename="survey-import-template.xls"');
+    res.send(buildExcelHtml({
+      headers: SURVEY_HEADERS,
+      template: true,
+      placeholders: [
+        'Title', 'Description', 'Type', 'No', 'Yes', '2026-03-15 09:00', '2026-03-20 23:59',
+      ],
+    }));
+  } catch (e) { next(e); }
+});
+router.get('/surveys/export', async (req, res, next) => {
+  try {
+    await assertEvent(req);
+    const r = await pool.query(`SELECT * FROM "SurveyTemplates" WHERE "EventId"=$1 ORDER BY "CreatedAt" DESC`, [req.params.eventId]);
+    const exportRows = rows(r).map((s) => [
+      s.Title, s.Description, s.SurveyType, s.IsAnonymous ? 'Yes' : 'No',
+      s.IsActive ? 'Yes' : 'No', s.OpensAt, s.ClosesAt,
+    ]);
+    res.type('application/vnd.ms-excel');
+    res.set('Content-Disposition', 'attachment; filename="surveys.xls"');
+    res.send(buildExcelHtml({ headers: SURVEY_HEADERS, rows: exportRows }));
+  } catch (e) { next(e); }
+});
+router.post('/surveys/import', importUpload.single('file'), async (req, res, next) => {
+  try {
+    await assertEvent(req);
+    if (!req.file) return res.status(400).json({ error: 'Please select an Excel/CSV file.' });
+    const objects = rowsToObjects(extractRows(req.file.buffer));
+    if (!objects.length) return res.status(400).json({ error: 'The import file contains no survey rows.' });
+
+    const results = [];
+    for (let i = 0; i < objects.length; i++) {
+      const o = objects[i];
+      const title = getCell(o, 'title');
+      if (!title) {
+        results.push({ row: i + 2, status: 'Failed', error: 'Title is required.' });
+        continue;
+      }
+      try {
+        const r = await pool.query(
+          `INSERT INTO "SurveyTemplates" ("EventId","Title","Description","SurveyType","IsAnonymous","IsActive","OpensAt","ClosesAt","CreatedByPersonId")
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING "SurveyTemplateId"`,
+          [
+            req.params.eventId, title, getCell(o, 'description') || null,
+            getCell(o, 'type') || 'Custom',
+            parseBoolCell(getCell(o, 'anonymous')) ?? false,
+            parseBoolCell(getCell(o, 'active')) ?? true,
+            getCell(o, 'opens at') || null, getCell(o, 'closes at') || null,
+            req.user.sub,
+          ]
+        );
+        results.push({ row: i + 2, status: 'Imported', surveyTemplateId: r.rows[0].SurveyTemplateId });
+      } catch (err) {
+        results.push({ row: i + 2, status: 'Failed', error: err.message });
+      }
+    }
+    res.json({ imported: results.filter((r) => r.status === 'Imported').length, failed: results.filter((r) => r.status === 'Failed').length, results });
+  } catch (e) { next(e); }
+});
+
 router.get('/surveys/:id',async(req,res,next)=>{try{await assertEvent(req);const s=await pool.query(`SELECT s.*, se."Title" AS "SessionTitle" FROM "SurveyTemplates" s LEFT JOIN "Sessions" se ON se."SessionId"=s."SessionId" WHERE s."EventId"=$1 AND s."SurveyTemplateId"=$2`,[req.params.eventId,req.params.id]);if(!s.rowCount)return res.status(404).json({error:'Survey not found.'});const q=await pool.query(`SELECT q.*, COALESCE(json_agg(json_build_object('optionId',o."OptionId",'label',o."Label") ORDER BY o."SortOrder") FILTER (WHERE o."OptionId" IS NOT NULL),'[]') AS "Options" FROM "SurveyQuestions" q LEFT JOIN "SurveyQuestionOptions" o ON o."SurveyQuestionId"=q."SurveyQuestionId" WHERE q."SurveyTemplateId"=$1 GROUP BY q."SurveyQuestionId" ORDER BY q."SortOrder"`,[req.params.id]);res.json({...s.rows[0],questions:q.rows});}catch(e){next(e);}});
 router.patch('/surveys/:id',async(req,res,next)=>{try{await assertEvent(req);const b=req.body||{};const map={sessionId:'SessionId',title:'Title',description:'Description',surveyType:'SurveyType',isAnonymous:'IsAnonymous',isActive:'IsActive',opensAt:'OpensAt',closesAt:'ClosesAt'};const sets=[];const vals=[req.params.eventId,req.params.id];for(const[k,c]of Object.entries(map)){if(b[k]!==undefined){sets.push(`"${c}"=$${vals.length+1}`);vals.push(b[k]);}}sets.push(`"UpdatedAt"=(now() AT TIME ZONE 'utc')`);const r=await pool.query(`UPDATE "SurveyTemplates" SET ${sets.join(',')} WHERE "EventId"=$1 AND "SurveyTemplateId"=$2 RETURNING *`,vals);if(!r.rowCount)return res.status(404).json({error:'Survey not found.'});res.json(row(r));}catch(e){next(e);}});
 router.delete('/surveys/:id',async(req,res,next)=>{try{await assertEvent(req);const r=await pool.query(`DELETE FROM "SurveyTemplates" WHERE "EventId"=$1 AND "SurveyTemplateId"=$2 RETURNING "SurveyTemplateId"`,[req.params.eventId,req.params.id]);if(!r.rowCount)return res.status(404).json({error:'Survey not found.'});res.json({ok:true});}catch(e){next(e);}});

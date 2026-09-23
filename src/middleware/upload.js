@@ -70,12 +70,33 @@ export const uploadVideo = multer({
   limits: { fileSize: MAX_VIDEO_SIZE_BYTES },
 });
 
-// Builds the public URL for an uploaded file. Base URL is configurable
-// via env var so switching hosts (or to cloud storage that serves
-// from a CDN domain) is a config change, not a code change — the
-// stored DB value is always a full URL, not a relative path, so
-// nothing downstream needs to know where the file physically lives.
-export function buildUploadUrl(filename) {
-  const base = process.env.UPLOADS_BASE_URL || `http://localhost:${process.env.PORT || 4000}/uploads`;
-  return `${base.replace(/\/$/, '')}/${filename}`;
+// Builds the public URL for an uploaded file.
+//
+// Previously this always used UPLOADS_BASE_URL from .env. That works
+// for exactly one environment at a time — whichever URL is written in
+// the committed .env file — so running the backend on localhost while
+// .env still has the production Render URL silently produced broken
+// image URLs (uploaded files existed on disk locally, but every URL
+// pointed at production, which doesn't have them).
+//
+// Fix: derive the base URL from the incoming request by default —
+// whatever host actually served this request is, by definition, the
+// right host for the files it serves. This is correct on localhost,
+// correct in production, and correct for anyone else who clones this
+// and runs it somewhere else, with zero .env editing.
+//
+// UPLOADS_BASE_URL remains supported as an explicit override, for
+// cases where files are served from a different host than the API
+// itself (e.g. a CDN or object storage domain in front of /uploads).
+// Leave it unset (or delete it from .env) to get the automatic,
+// request-based behavior described above.
+export function buildUploadUrl(filename, req) {
+  const override = process.env.UPLOADS_BASE_URL;
+  if (override) {
+    return `${override.replace(/\/$/, '')}/${filename}`;
+  }
+  if (req) {
+    return `${req.protocol}://${req.get('host')}/uploads/${filename}`;
+  }
+  return `http://localhost:${process.env.PORT || 4000}/uploads/${filename}`;
 }

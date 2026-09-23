@@ -1150,7 +1150,7 @@ router.post('/events/:id/photos', requireAuth, (req, res, next) => {
       await client.query('BEGIN');
       let gallery = await client.query(`SELECT "GalleryId" FROM "MediaGalleries" WHERE "EventId"=$1 AND "IsDeleted"=false ORDER BY "SortOrder","CreatedAt" LIMIT 1`, [req.params.id]);
       if (!gallery.rowCount) gallery = await client.query(`INSERT INTO "MediaGalleries" ("EventId","GalleryName","Description","IsActive","SortOrder") VALUES ($1,'Attendee Photos','Photos shared by attendees',true,0) RETURNING "GalleryId"`, [req.params.id]);
-      const url = buildUploadUrl(req.file.filename);
+      const url = buildUploadUrl(req.file.filename, req);
       const title = String(req.body?.title || req.file.originalname || 'Photo').slice(0,300);
       const item = await client.query(`INSERT INTO "MediaItems" ("GalleryId","EventId","MediaType","Title","FileUrl","ThumbnailUrl","FileSize","MimeType","UploadedByPersonId","IsPublished","SortOrder") VALUES ($1,$2,'Image',$3,$4,$4,$5,$6,$7,true,0) RETURNING *`, [gallery.rows[0].GalleryId, req.params.id, title, url, req.file.size, req.file.mimetype, req.user.sub]);
       await client.query('COMMIT');

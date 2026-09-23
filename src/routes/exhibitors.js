@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import multer from 'multer';
 import {
   getEventById,
   getExhibitorsForEvent,
@@ -10,8 +11,10 @@ import {
 } from '../data/store.js';
 import { serializeExhibitor, serializeExhibitorCategory } from '../data/serializers.js';
 import { requireAuth } from '../middleware/auth.js';
+import { buildExcelHtml, extractRows, rowsToObjects, getCell } from '../utils/excelImportExport.js';
 
 const router = Router({ mergeParams: true });
+const importUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
 router.use(requireAuth);
 
@@ -46,6 +49,115 @@ async function attachCategories(exhibitor) {
   const categories = await getExhibitorCategories(exhibitor.id);
   return { ...exhibitor, categories: categories.map(serializeExhibitorCategory).map((c) => c.name) };
 }
+
+const EXHIBITOR_HEADERS = [
+  'Company', 'Description', 'Logo URL', 'Booth Number', 'Slogan', 'Address',
+  'Website', 'Photo URL', 'Video Thumbnail URL', 'Video URL', 'Contact Email',
+  'Contact Name', 'Contact Phone', 'Secondary Contact Email',
+  'Secondary Contact Name', 'Secondary Contact Phone', 'Categories',
+];
+
+// GET /api/events/:eventId/exhibitors/template — an Excel-compatible
+// .xls with just the headers (plus one placeholder row) so an
+// organizer can fill it in and re-upload via /import below.
+router.get('/template', async (req, res, next) => {
+  try {
+    const event = await assertOwnedEvent(req, res);
+    if (!event) return;
+    res.type('application/vnd.ms-excel');
+    res.set('Content-Disposition', 'attachment; filename="exhibitor-import-template.xls"');
+    res.send(buildExcelHtml({ headers: EXHIBITOR_HEADERS, template: true }));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/events/:eventId/exhibitors/export — the current exhibitor
+// list in the same format the template uses, so it can be edited and
+// re-imported.
+router.get('/export', async (req, res, next) => {
+  try {
+    const event = await assertOwnedEvent(req, res);
+    if (!event) return;
+    const exhibitors = await getExhibitorsForEvent(req.params.eventId);
+    const serialized = await Promise.all(exhibitors.map((x) => attachCategories(serializeExhibitor(x))));
+    const rows = serialized.map((x) => [
+      x.company, x.description, x.logoUrl, x.boothNumber, x.slogan, x.address,
+      x.website, x.photoUrl, x.videoThumbnailUrl, x.videoUrl, x.contactEmail,
+      x.contactName, x.contactPhone, x.secondaryContactEmail,
+      x.secondaryContactName, x.secondaryContactPhone, (x.categories || []).join('; '),
+    ]);
+    res.type('application/vnd.ms-excel');
+    res.set('Content-Disposition', `attachment; filename="exhibitors-${event.EventCode || 'event'}.xls"`);
+    res.send(buildExcelHtml({ headers: EXHIBITOR_HEADERS, rows }));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/events/:eventId/exhibitors/import — bulk-add exhibitors
+// from the template above (or a CSV/TSV saved from Excel). Each row
+// goes through the same validation and create path as the "Add
+// Exhibitor" form, so a bad row is reported and skipped rather than
+// failing the whole batch.
+router.post('/import', importUpload.single('file'), async (req, res, next) => {
+  try {
+    const event = await assertOwnedEvent(req, res);
+    if (!event) return;
+    if (!req.file) return res.status(400).json({ error: 'Please select an Excel/CSV file.' });
+
+    const objects = rowsToObjects(extractRows(req.file.buffer));
+    if (!objects.length) return res.status(400).json({ error: 'The import file contains no exhibitor rows.' });
+
+    const results = [];
+    for (let i = 0; i < objects.length; i++) {
+      const o = objects[i];
+      const payload = {
+        company: getCell(o, 'company'),
+        description: getCell(o, 'description'),
+        logoUrl: getCell(o, 'logo url'),
+        boothNumber: getCell(o, 'booth number'),
+        slogan: getCell(o, 'slogan'),
+        address: getCell(o, 'address'),
+        website: getCell(o, 'website'),
+        photoUrl: getCell(o, 'photo url'),
+        videoThumbnailUrl: getCell(o, 'video thumbnail url'),
+        videoUrl: getCell(o, 'video url'),
+        contactEmail: getCell(o, 'contact email'),
+        contactName: getCell(o, 'contact name'),
+        contactPhone: getCell(o, 'contact phone'),
+        secondaryContactEmail: getCell(o, 'secondary contact email'),
+        secondaryContactName: getCell(o, 'secondary contact name'),
+        secondaryContactPhone: getCell(o, 'secondary contact phone'),
+      };
+      const categories = getCell(o, 'categories').split(';').map((c) => c.trim()).filter(Boolean);
+
+      const validationError = validateCreatePayload(payload);
+      if (validationError) {
+        results.push({ row: i + 2, status: 'Failed', error: validationError });
+        continue;
+      }
+      try {
+        const created = await createExhibitor(req.params.eventId, {
+          ...payload,
+          contactEmail: payload.contactEmail.trim().toLowerCase(),
+          categories,
+        });
+        results.push({ row: i + 2, status: 'Imported', exhibitorProfileId: created.ExhibitorProfileId });
+      } catch (err) {
+        results.push({ row: i + 2, status: 'Failed', error: err.message });
+      }
+    }
+
+    res.json({
+      imported: results.filter((r) => r.status === 'Imported').length,
+      failed: results.filter((r) => r.status === 'Failed').length,
+      results,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
 
 // GET /api/events/:eventId/exhibitors
 router.get('/', async (req, res, next) => {

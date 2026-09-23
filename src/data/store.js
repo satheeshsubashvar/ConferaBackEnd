@@ -1,5 +1,6 @@
 import { pool } from './db.js';
 import { seedIfEmpty } from './seed.js';
+import { sendPortalInviteIfNeeded } from '../utils/portalInvite.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -29,6 +30,10 @@ export async function initDatabase() {
   await pool.query(loginBannerSql);
   const realtimeSql = fs.readFileSync(path.join(__dirname, 'add_portal_realtime_features.sql'), 'utf8');
   await pool.query(realtimeSql);
+  const emailVerificationSql = fs.readFileSync(path.join(__dirname, 'add_email_verification.sql'), 'utf8');
+  await pool.query(emailVerificationSql);
+  const passwordResetSql = fs.readFileSync(path.join(__dirname, 'add_password_reset.sql'), 'utf8');
+  await pool.query(passwordResetSql);
 }
 
 // ---------------------------------------------------------------------
@@ -65,6 +70,167 @@ export async function findAttendeeByEmail(email, eventId) {
   return rows[0] || null;
 }
 
+// Powers the Portal's "which event am I part of?" entry point (see
+// routes/portalAuth.js POST /find-events) — the reason a shared,
+// organizer-agnostic /login screen no longer needs a hardcoded
+// VITE_DEFAULT_EVENT_ID to guess which event's branding to show. Given
+// just an email, this returns every event that email can actually sign
+// into: as a registered participant (Attendee/Speaker/Sponsor/
+// Exhibitor) of a *published* event — a Draft event isn't public yet,
+// so it's excluded here the same way GET /api/public/events/:id
+// excludes it — or as the organizer/owner of an event under their own
+// organization, in ANY status, since previewing your own not-yet-
+// published event is the whole point of that relationship.
+export async function findEventsForEmail(email) {
+  const { rows } = await pool.query(
+    `SELECT DISTINCT ON (e."EventId")
+       e."EventId" AS id, e."Title" AS name, e."StartDate", e."EndDate",
+       e."Status", e."LogoUrl" AS "EventLogoUrl", e."BannerImageUrl",
+       ab."LogoUrl" AS "BrandLogoUrl", ab."PrimaryColor", ab."SecondaryColor"
+     FROM "Event" e
+     LEFT JOIN "AppBrandings" ab ON ab."EventId" = e."EventId"
+     WHERE e."IsDeleted" = false
+       AND (
+         e."EventId" IN (
+           SELECT ep."EventId" FROM "EventParticipant" ep
+           JOIN "Person" p ON p."PersonId" = ep."PersonId"
+           WHERE lower(p."Email") = lower($1)
+             AND ep."Role" IN ('Attendee','Speaker','Sponsor','Exhibitor')
+             AND e."Status" = 'Published'
+         )
+         OR e."EventId" IN (
+           SELECT e2."EventId" FROM "Event" e2
+           JOIN "OrganizationUsers" ou ON ou."OrganizationId" = e2."OrganizationId"
+           JOIN "Person" p2 ON p2."PersonId" = ou."PersonId"
+           WHERE lower(p2."Email") = lower($1) AND ou."Status" = 'Active'
+         )
+       )
+     ORDER BY e."EventId", e."StartDate" DESC NULLS LAST`,
+    [email]
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    name: r.name,
+    startDate: r.StartDate,
+    endDate: r.EndDate,
+    status: r.Status,
+    logoUrl: r.BrandLogoUrl || r.EventLogoUrl || '',
+    heroImageUrl: r.BannerImageUrl || '',
+    colorFrom: r.PrimaryColor || '#7c3aed',
+    colorTo: r.SecondaryColor || '#4c1d95',
+  }));
+}
+
+// Self-registration from the Portal's "Sign up here" (see
+// routes/portalAuth.js POST /register and SignUpPage.jsx). Unlike
+// every other way a Person gets added to an event — Attendees page,
+// Speaker/Sponsor/Exhibitor Center, any Excel import — this person is
+// choosing their own password right now, so there's no placeholder
+// hash and no invite email to send; createSpeaker/createSponsor/
+// createExhibitor are still reused for the Speaker/Sponsor/Exhibitor
+// branches (so the resulting rows are identical to an organizer-added
+// one, including the SpeakerProfile/SponsorProfile/ExhibitorProfile
+// row those need to actually show up anywhere), just with their
+// invite email suppressed and the real password swapped in right after.
+export async function registerPortalParticipant({ eventId, role, email, passwordHash, firstName, lastName, company, jobTitle }) {
+  const normalizedEmail = String(email).trim().toUpperCase();
+
+  const { rows: dupRows } = await pool.query(
+    `SELECT ep."EventParticipantId" FROM "EventParticipant" ep
+     JOIN "Person" p ON p."PersonId" = ep."PersonId"
+     WHERE ep."EventId" = $1 AND p."NormalizedEmail" = $2 AND ep."IsDeleted" = false
+       AND ep."Role" IN ('Attendee','Speaker','Sponsor','Exhibitor')
+     LIMIT 1`,
+    [eventId, normalizedEmail]
+  );
+  if (dupRows.length) {
+    const err = new Error("You're already registered for this event. Try signing in instead.");
+    err.status = 409;
+    throw err;
+  }
+
+  const { rows: existingPersonRows } = await pool.query(
+    'SELECT "PersonId", "PasswordHash" FROM "Person" WHERE "NormalizedEmail" = $1',
+    [normalizedEmail]
+  );
+  if (
+    existingPersonRows.length &&
+    existingPersonRows[0].PasswordHash &&
+    !existingPersonRows[0].PasswordHash.startsWith('not-a-real-hash')
+  ) {
+    const err = new Error('An account with this email already exists. Please sign in instead.');
+    err.status = 409;
+    throw err;
+  }
+
+  const fullName = `${firstName} ${lastName}`.trim();
+
+  if (role === 'Speaker') {
+    await createSpeaker(eventId, { email, firstName, lastName, company, jobTitle }, { skipInvite: true });
+  } else if (role === 'Sponsor') {
+    await createSponsor(
+      eventId,
+      { contactEmail: email, contactName: fullName, companyName: company || fullName },
+      { skipInvite: true }
+    );
+  } else if (role === 'Exhibitor') {
+    await createExhibitor(
+      eventId,
+      { contactEmail: email, contactName: fullName, company: company || fullName },
+      { skipInvite: true }
+    );
+  } else {
+    // Attendee — no dedicated profile table, just Person +
+    // EventParticipant, mirroring routes/attendees.js's own POST /.
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      let personId;
+      if (existingPersonRows.length) {
+        personId = existingPersonRows[0].PersonId;
+        await client.query(
+          `UPDATE "Person" SET "FirstName" = $2, "LastName" = $3, "FullName" = $4,
+             "Company" = COALESCE($5, "Company"), "JobTitle" = COALESCE($6, "JobTitle"),
+             "UpdatedAt" = (now() AT TIME ZONE 'utc')
+           WHERE "PersonId" = $1`,
+          [personId, firstName, lastName, fullName, company || null, jobTitle || null]
+        );
+      } else {
+        const { rows } = await client.query(
+          `INSERT INTO "Person" ("Email", "NormalizedEmail", "PasswordHash", "FirstName", "LastName", "FullName", "Company", "JobTitle")
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING "PersonId"`,
+          [email, normalizedEmail, 'not-a-real-hash-self-registered', firstName, lastName, fullName, company || null, jobTitle || null]
+        );
+        personId = rows[0].PersonId;
+      }
+      await client.query(
+        `INSERT INTO "EventParticipant" ("EventId", "PersonId", "Role", "Company", "JobTitle", "RegistrationCode", "Status")
+         VALUES ($1,$2,'Attendee',$3,$4,$5,'Pending')`,
+        [eventId, personId, company || null, jobTitle || null, `ATT-${Date.now()}`]
+      );
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  const { rows: personRows } = await pool.query(
+    'SELECT "PersonId" FROM "Person" WHERE "NormalizedEmail" = $1',
+    [normalizedEmail]
+  );
+  const personId = personRows[0].PersonId;
+  await pool.query(
+    `UPDATE "Person" SET "PasswordHash" = $2, "PasswordResetToken" = NULL, "PasswordResetExpiresAt" = NULL
+     WHERE "PersonId" = $1`,
+    [personId, passwordHash]
+  );
+
+  return { personId, role };
+}
+
 // Organizers don't have an EventParticipant row (they own/manage the
 // event via OrganizationUsers, not attend it as a participant), but
 // the Portal login should still admit them — e.g. to preview the
@@ -81,6 +247,150 @@ export async function findOrganizerByEmailForEvent(email, eventId) {
     [email, eventId]
   );
   return rows[0] || null;
+}
+
+// Turns "Bright Meetups & Co." into "bright-meetups-co" and, if that
+// slug is already taken, "bright-meetups-co-2", "-3", etc. Mirrors the
+// unique Organizations.Slug constraint set up by the seed data.
+async function uniqueOrganizationSlug(client, name) {
+  const base = String(name || 'organization')
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48) || 'organization';
+
+  let slug = base;
+  let suffix = 2;
+  // Small table, small loop — a handful of iterations at most in
+  // practice. Simpler and safer than a racy "generate and hope".
+  while (true) {
+    const { rowCount } = await client.query('SELECT 1 FROM "Organizations" WHERE "Slug" = $1', [slug]);
+    if (!rowCount) return slug;
+    slug = `${base}-${suffix++}`;
+  }
+}
+
+// Creates a brand-new Organization owned by a brand-new Person, in one
+// transaction — this is what "Create Organizer Account" does. The
+// caller (the /api/auth/register route) is responsible for hashing
+// the password and generating the verification token; this function
+// just persists what it's given.
+export async function registerOrganizer({
+  email,
+  passwordHash,
+  firstName,
+  lastName,
+  organizationName,
+  verificationToken,
+  verificationExpiresAt,
+}) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const normalizedEmail = String(email).trim().toUpperCase();
+    const existing = await client.query('SELECT "PersonId" FROM "Person" WHERE "NormalizedEmail" = $1', [normalizedEmail]);
+    if (existing.rowCount) {
+      const err = new Error('An account with this email already exists.');
+      err.status = 409;
+      throw err;
+    }
+
+    const personRes = await client.query(
+      `INSERT INTO "Person"
+         ("Email", "NormalizedEmail", "PasswordHash", "FirstName", "LastName",
+          "EmailVerifiedAt", "EmailVerificationToken", "EmailVerificationExpiresAt")
+       VALUES ($1,$2,$3,$4,$5, NULL, $6, $7)
+       RETURNING "PersonId"`,
+      [String(email).trim(), normalizedEmail, passwordHash, firstName, lastName, verificationToken, verificationExpiresAt]
+    );
+    const personId = personRes.rows[0].PersonId;
+
+    const slug = await uniqueOrganizationSlug(client, organizationName);
+    const orgRes = await client.query(
+      `INSERT INTO "Organizations" ("Name", "Slug", "OwnerPersonId")
+       VALUES ($1, $2, $3) RETURNING "OrganizationId"`,
+      [organizationName, slug, personId]
+    );
+    const organizationId = orgRes.rows[0].OrganizationId;
+
+    // "Owner" is the global system role seeded by migration 001
+    // (OrganizationId IS NULL) — same lookup seed.js uses.
+    const ownerRoleRes = await client.query(
+      `SELECT "RoleId" FROM "OrganizationRoles" WHERE "Name" = 'Owner' AND "OrganizationId" IS NULL LIMIT 1`
+    );
+    if (!ownerRoleRes.rowCount) {
+      throw new Error('OrganizationRoles has no global "Owner" role. Has migration 001_multi_tenancy.sql been applied?');
+    }
+    const ownerRoleId = ownerRoleRes.rows[0].RoleId;
+
+    await client.query(
+      `INSERT INTO "OrganizationUsers" ("OrganizationId", "PersonId", "RoleId", "Status", "JoinedAt")
+       VALUES ($1, $2, $3, 'Active', now())`,
+      [organizationId, personId, ownerRoleId]
+    );
+
+    await client.query('COMMIT');
+    return { personId, organizationId, slug };
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+export async function findPersonByVerificationToken(token) {
+  const { rows } = await pool.query(
+    'SELECT * FROM "Person" WHERE "EmailVerificationToken" = $1',
+    [token]
+  );
+  return rows[0] || null;
+}
+
+export async function markEmailVerified(personId) {
+  await pool.query(
+    `UPDATE "Person"
+     SET "EmailVerifiedAt" = now(), "EmailVerificationToken" = NULL, "EmailVerificationExpiresAt" = NULL
+     WHERE "PersonId" = $1`,
+    [personId]
+  );
+}
+
+export async function setEmailVerificationToken(personId, token, expiresAt) {
+  await pool.query(
+    `UPDATE "Person"
+     SET "EmailVerificationToken" = $2, "EmailVerificationExpiresAt" = $3
+     WHERE "PersonId" = $1`,
+    [personId, token, expiresAt]
+  );
+}
+
+// Forgot/set-password — shared by every account type (Organizer,
+// Attendee, Speaker, Sponsor, Exhibitor) since PasswordHash lives on
+// the one shared Person table. See add_password_reset.sql for why
+// this exists.
+export async function setPasswordResetToken(personId, token, expiresAt) {
+  await pool.query(
+    `UPDATE "Person" SET "PasswordResetToken" = $2, "PasswordResetExpiresAt" = $3 WHERE "PersonId" = $1`,
+    [personId, token, expiresAt]
+  );
+}
+
+export async function findPersonByPasswordResetToken(token) {
+  const { rows } = await pool.query('SELECT * FROM "Person" WHERE "PasswordResetToken" = $1', [token]);
+  return rows[0] || null;
+}
+
+export async function resetPersonPassword(personId, passwordHash) {
+  await pool.query(
+    `UPDATE "Person"
+     SET "PasswordHash" = $2, "PasswordResetToken" = NULL, "PasswordResetExpiresAt" = NULL,
+         "UpdatedAt" = (now() AT TIME ZONE 'utc')
+     WHERE "PersonId" = $1`,
+    [personId, passwordHash]
+  );
 }
 
 export async function getOrganizationForPerson(personId) {
@@ -315,28 +625,30 @@ async function findOrCreateSponsorContact(client, email, contactName) {
   if (!normalizedEmail) throw new Error('Sponsor contact email is required.');
 
   const { rows: existingRows } = await client.query(
-    'SELECT "PersonId" FROM "Person" WHERE "NormalizedEmail" = $1 LIMIT 1',
+    'SELECT "PersonId", "PasswordHash" FROM "Person" WHERE "NormalizedEmail" = $1 LIMIT 1',
     [normalizedEmail]
   );
-  if (existingRows.length) return existingRows[0].PersonId;
+  if (existingRows.length) {
+    return { personId: existingRows[0].PersonId, passwordHash: existingRows[0].PasswordHash, isNew: false };
+  }
 
   const nameParts = (contactName || 'Sponsor Contact').trim().split(/\s+/);
   const firstName = nameParts[0] || 'Sponsor';
   const lastName = nameParts.slice(1).join(' ') || 'Contact';
   const { rows } = await client.query(
     `INSERT INTO "Person" ("Email","NormalizedEmail","PasswordHash","FirstName","LastName")
-     VALUES ($1,$2,$3,$4,$5) RETURNING "PersonId"`,
+     VALUES ($1,$2,$3,$4,$5) RETURNING "PersonId", "PasswordHash"`,
     [String(email).trim(), normalizedEmail, 'not-a-real-hash-sponsor-manager-created', firstName, lastName]
   );
-  return rows[0].PersonId;
+  return { personId: rows[0].PersonId, passwordHash: rows[0].PasswordHash, isNew: true };
 }
 
-export async function createSponsor(eventId, payload) {
+export async function createSponsor(eventId, payload, options = {}) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    const personId = await findOrCreateSponsorContact(client, payload.contactEmail, payload.contactName);
+    const { personId, passwordHash } = await findOrCreateSponsorContact(client, payload.contactEmail, payload.contactName);
     const regCode = `SPN-${Date.now()}`;
     const { rows: participantRows } = await client.query(
       `INSERT INTO "EventParticipant" ("EventId","PersonId","Role","RegistrationCode")
@@ -358,6 +670,12 @@ export async function createSponsor(eventId, payload) {
     );
 
     await client.query('COMMIT');
+    if (!options.skipInvite) {
+      await sendPortalInviteIfNeeded({
+        personId, email: payload.contactEmail, fullName: payload.contactName,
+        passwordHash, eventId,
+      });
+    }
     return getSponsorById(rows[0].SponsorProfileId);
   } catch (err) {
     await client.query('ROLLBACK');
@@ -1328,18 +1646,30 @@ export async function removeSessionAuthor(authorId) {
 // ---------------------------------------------------------------------
 // Global Confera Admin Login Page Settings
 // ---------------------------------------------------------------------
+// Out-of-the-box look for the Admin login screen. Matches the
+// Confera marketing site's own hero — same soft coral/brand glow on
+// a light background — rather than an arbitrary flat color, so an
+// unconfigured install already looks like the rest of the product.
+// An organizer can still override any of this from Settings > Login
+// Banner Settings; these are just what shows before they do.
 const DEFAULT_LOGIN_PAGE_SETTINGS = {
-  background: { mode: 'color', color: '#1d4ed8', imageUrl: '' },
+  background: {
+    mode: 'color',
+    color:
+      'radial-gradient(60% 50% at 88% 8%, rgba(255,107,87,.16), transparent 70%), ' +
+      'radial-gradient(50% 45% at 0% 100%, rgba(63,60,187,.14), transparent 70%), #F6F5FC',
+    imageUrl: '',
+  },
   banner: {
     enabled: true,
     imageUrl: '',
     columns: 2,
-    title: 'Confera Event Management System',
-    subtitle: 'Manage your events, attendees and event experience from one place.',
+    title: 'Run your event from one place.',
+    subtitle: 'Build the agenda, manage people, and watch it come together — all in Confera Admin.',
     cards: [
-      { title: 'Event Management', description: 'Create and manage your events.' },
-      { title: 'Engage & Network', description: 'Connect attendees, speakers and sponsors.' },
-      { title: 'Powerful Analytics', description: 'Track your event performance.' },
+      { title: 'Build the agenda', description: 'Sessions, tracks and speakers, organized in minutes.' },
+      { title: 'Manage every role', description: 'Attendees, speakers, sponsors and exhibitors, in one place.' },
+      { title: 'See it live', description: 'Registrations and engagement, tracked as the event runs.' },
       { title: 'Confera EMS', description: 'Everything your event team needs.' },
     ],
   },
@@ -1556,7 +1886,7 @@ export async function getSpeakerByProfileId(speakerProfileId) {
   return rows[0] || null;
 }
 
-export async function createSpeaker(eventId, payload) {
+export async function createSpeaker(eventId, payload, options = {}) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -1569,13 +1899,15 @@ export async function createSpeaker(eventId, payload) {
     // so silently trying to INSERT a duplicate would crash rather
     // than do the sensible thing.
     const { rows: existingRows } = await client.query(
-      'SELECT "PersonId" FROM "Person" WHERE "NormalizedEmail" = $1',
+      'SELECT "PersonId", "PasswordHash" FROM "Person" WHERE "NormalizedEmail" = $1',
       [normalizedEmail]
     );
 
     let personId;
+    let passwordHash;
     if (existingRows.length > 0) {
       personId = existingRows[0].PersonId;
+      passwordHash = existingRows[0].PasswordHash;
       await client.query(
         `UPDATE "Person" SET "FirstName" = $2, "LastName" = $3, "Company" = $4,
            "JobTitle" = $5, "Country" = $6,
@@ -1587,7 +1919,7 @@ export async function createSpeaker(eventId, payload) {
     } else {
       const { rows: personRows } = await client.query(
         `INSERT INTO "Person" ("Email", "NormalizedEmail", "PasswordHash", "FirstName", "LastName", "Company", "JobTitle", "Country", "ProfilePictureUrl")
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING "PersonId"`,
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING "PersonId", "PasswordHash"`,
         [
           payload.email, normalizedEmail, 'not-a-real-hash-speaker-center-created',
           payload.firstName, payload.lastName, payload.company || null,
@@ -1595,6 +1927,7 @@ export async function createSpeaker(eventId, payload) {
         ]
       );
       personId = personRows[0].PersonId;
+      passwordHash = personRows[0].PasswordHash;
     }
 
     // A Person can only be a Speaker once per event — check before
@@ -1667,6 +2000,13 @@ export async function createSpeaker(eventId, payload) {
     }
 
     await client.query('COMMIT');
+    if (!options.skipInvite) {
+      await sendPortalInviteIfNeeded({
+        personId, email: payload.email,
+        fullName: `${payload.firstName} ${payload.lastName}`.trim(),
+        passwordHash, eventId,
+      });
+    }
     return getSpeakerByProfileId(speakerProfileId);
   } catch (err) {
     await client.query('ROLLBACK');
@@ -1826,10 +2166,12 @@ export async function getExhibitorDocuments(exhibitorProfileId) {
 async function findOrCreatePersonForContact(client, email, contactName) {
   const normalizedEmail = email.toUpperCase();
   const { rows: existingRows } = await client.query(
-    'SELECT "PersonId" FROM "Person" WHERE "NormalizedEmail" = $1',
+    'SELECT "PersonId", "PasswordHash" FROM "Person" WHERE "NormalizedEmail" = $1',
     [normalizedEmail]
   );
-  if (existingRows.length > 0) return existingRows[0].PersonId;
+  if (existingRows.length > 0) {
+    return { personId: existingRows[0].PersonId, passwordHash: existingRows[0].PasswordHash };
+  }
 
   const nameParts = (contactName || 'Exhibitor Contact').trim().split(/\s+/);
   const firstName = nameParts[0] || 'Exhibitor';
@@ -1837,10 +2179,10 @@ async function findOrCreatePersonForContact(client, email, contactName) {
 
   const { rows } = await client.query(
     `INSERT INTO "Person" ("Email", "NormalizedEmail", "PasswordHash", "FirstName", "LastName")
-     VALUES ($1,$2,$3,$4,$5) RETURNING "PersonId"`,
+     VALUES ($1,$2,$3,$4,$5) RETURNING "PersonId", "PasswordHash"`,
     [email, normalizedEmail, 'not-a-real-hash-exhibitor-manager-created', firstName, lastName]
   );
-  return rows[0].PersonId;
+  return { personId: rows[0].PersonId, passwordHash: rows[0].PasswordHash };
 }
 
 const EXHIBITOR_FIELD_MAP = {
@@ -1852,12 +2194,12 @@ const EXHIBITOR_FIELD_MAP = {
   secondaryContactPhone: 'SecondaryContactPhone',
 };
 
-export async function createExhibitor(eventId, payload) {
+export async function createExhibitor(eventId, payload, options = {}) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    const personId = await findOrCreatePersonForContact(client, payload.contactEmail, payload.contactName);
+    const { personId, passwordHash } = await findOrCreatePersonForContact(client, payload.contactEmail, payload.contactName);
 
     const regCode = `EXH-${Date.now()}`;
     const { rows: participantRows } = await client.query(
@@ -1891,6 +2233,12 @@ export async function createExhibitor(eventId, payload) {
     }
 
     await client.query('COMMIT');
+    if (!options.skipInvite) {
+      await sendPortalInviteIfNeeded({
+        personId, email: payload.contactEmail, fullName: payload.contactName,
+        passwordHash, eventId,
+      });
+    }
     return getExhibitorById(exhibitorProfileId);
   } catch (err) {
     await client.query('ROLLBACK');
